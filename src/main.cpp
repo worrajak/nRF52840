@@ -14,6 +14,8 @@
 #include <nrf_gpio.h>
 
 // ============ PIN DEFINITIONS ============
+#define STATUS_LED   15   // P0.15 — blink on TX as activity indicator
+
 // RFM95 LoRa SPI — raw GPIO numbers (nrf_gpio_* functions)
 #define RFM95_MISO   2    // P0.02
 #define RFM95_SCK    43   // P1.11
@@ -229,9 +231,11 @@ void sendPacket() {
     packet[3] = 0x00;
     memcpy(&packet[4], encrypted, encLen);
 
-    // TX
-    setModeSleep();
-    rfm95WriteReg(0x0D, 0x00);      // FIFO ptr
+    // Wake RFM95 to Standby before FIFO access (datasheet requirement)
+    // Sleep mode clears FIFO — must be in Standby to write
+    rfm95WriteReg(0x01, 0x81);      // LoRa + Standby
+    delay(10);                       // Wait for oscillator startup
+    rfm95WriteReg(0x0D, 0x00);      // FIFO ptr to base
     rfm95WriteReg(0x22, totalLen);   // Payload length
     rfm95WriteFifo(packet, totalLen);
     rfm95WriteReg(0x01, 0x83);      // LoRa + TX
@@ -272,6 +276,10 @@ void setup() {
     delay(2000);
     Serial.println(F("\n=== nRF52840 LoRa Node 115 (Low Power) ==="));
 
+    // LED indicator
+    pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, LOW);
+
     // Enable low-power mode
     NRF_POWER->TASKS_LOWPWR = 1;
 
@@ -288,7 +296,11 @@ void setup() {
 // ============ LOOP ============
 void loop() {
     batteryMV = readBatteryMV();
+
+    // LED ON → TX → LED OFF (visual indicator)
+    digitalWrite(STATUS_LED, HIGH);
     sendPacket();
+    digitalWrite(STATUS_LED, LOW);
 
     // Deep sleep via FreeRTOS tickless idle (RTC1 + __WFE)
     // CPU draws ~2-5 µA, RFM95 in sleep ~0.2 µA
