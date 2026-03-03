@@ -1,20 +1,26 @@
 /*
- * nRF52840 LoRa P2P Node — Low-Power TX-Only
+ * nRF52840 LoRa P2P Node — Low-Power TX with OLED Status
  * Node ID: 115
  *
  * Protocol: RadioHead-compatible headers + XOR encryption + CRC16
  * Packet: [TO=0xFF][FROM=115][ID][FLAGS=0x00][encrypted_payload+CRC16]
  * Payload: N:115|S:seq|T:temp|H:hum|B:bat
  *
- * Power: ~0.2 mA average (deep sleep between TX via FreeRTOS tickless idle)
+ * Power: OLED adds ~15-20mA (hardware only — remove OLED for deployment)
  * SPI: software bit-bang using nrf_gpio_* (n-able PINS_COUNT=34 bug)
  */
 
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
 #include <nrf_gpio.h>
 
 // ============ PIN DEFINITIONS ============
-#define STATUS_LED   15   // P0.15 — blink on TX as activity indicator
+#define STATUS_LED   15   // P0.15
+
+// OLED I2C
+#define OLED_SDA     36   // P1.04
+#define OLED_SCL     11   // P0.11
 
 // RFM95 LoRa SPI — raw GPIO numbers (nrf_gpio_* functions)
 #define RFM95_MISO   2    // P0.02
@@ -40,10 +46,45 @@ static const char* CRYPTO_KEY = "1234567890000000";
 #define CRYPTO_KEY_LEN 16
 
 // ============ GLOBALS ============
-uint16_t batteryMV = 3300;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+bool oled_ok = false;
 bool lora_ok = false;
+uint16_t batteryMV = 3300;
 uint8_t txSequenceNum = 0;
 uint8_t rhMsgId = 0;
+bool lastTxOk = false;
+
+// ============ OLED DISPLAY ============
+void oledStatus(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr) {
+    if (!oled_ok) return;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    // Header: Node ID + Battery
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    char hdr[22];
+    snprintf(hdr, sizeof(hdr), "N:%d  %dmV", THIS_NODE_ADDRESS, batteryMV);
+    display.print(hdr);
+
+    // Main status (big)
+    display.setTextSize(2);
+    display.setCursor(0, 16);
+    display.print(line1);
+
+    // Detail lines
+    display.setTextSize(1);
+    if (line2) {
+        display.setCursor(0, 40);
+        display.print(line2);
+    }
+    if (line3) {
+        display.setCursor(0, 52);
+        display.print(line3);
+    }
+
+    display.display();
+}
 
 // ============ nRF GPIO HELPERS ============
 static inline void gpioSet(uint32_t pin)   { nrf_gpio_pin_set(pin); }
@@ -164,7 +205,6 @@ void setModeSleep() {
 
 // ============ LORA INIT ============
 bool initLoRa() {
-    // Configure GPIO
     gpioOutput(RFM95_CS);
     gpioSet(RFM95_CS);
     gpioInput(RFM95_DIO0);
@@ -172,7 +212,6 @@ bool initLoRa() {
     gpioSet(RFM95_RST);
     delay(10);
 
-    // Software SPI pins
     gpioOutput(RFM95_MOSI);
     gpioOutput(RFM95_SCK);
     gpioInput(RFM95_MISO);
@@ -190,39 +229,31 @@ bool initLoRa() {
     Serial.print(F("LoRa ver: 0x"));
     Serial.println(version, HEX);
 
-    if (version != 0x12) {
-        Serial.println(F("LoRa: SPI FAIL!"));
-        return false;
-    }
+    if (version != 0x12) return false;
 
     configureLoRaModem();
-    setModeSleep();  // Start in sleep mode
+    setModeSleep();
 
-    Serial.println(F("LoRa: OK"));
     return true;
 }
 
 // ============ LORA TX (RadioHead compatible) ============
-void sendPacket() {
-    // Build plaintext payload
+bool sendPacket() {
     char payload[80];
     snprintf(payload, sizeof(payload), "N:%d|S:%d|T:%d|H:%d|B:%d",
              THIS_NODE_ADDRESS, txSequenceNum,
-             0, 0, batteryMV);  // T/H = 0 (no sensor)
+             0, 0, batteryMV);
 
     int payloadLen = strlen(payload);
 
-    // Encrypt
     uint8_t encrypted[payloadLen + 2];
     xorEncrypt(payload, payloadLen, encrypted);
 
-    // CRC16 on encrypted data
     uint16_t crc = calculateCRC16(encrypted, payloadLen);
     encrypted[payloadLen] = (crc >> 8) & 0xFF;
     encrypted[payloadLen + 1] = crc & 0xFF;
     uint8_t encLen = payloadLen + 2;
 
-    // RadioHead header (4 bytes) + encrypted payload + CRC
     uint8_t totalLen = 4 + encLen;
     uint8_t packet[totalLen];
     packet[0] = BROADCAST_ADDRESS;
@@ -232,7 +263,6 @@ void sendPacket() {
     memcpy(&packet[4], encrypted, encLen);
 
     // Wake RFM95 to Standby before FIFO access (datasheet requirement)
-    // Sleep mode clears FIFO — must be in Standby to write
     rfm95WriteReg(0x01, 0x81);      // LoRa + Standby
     delay(10);                       // Wait for oscillator startup
     rfm95WriteReg(0x0D, 0x00);      // FIFO ptr to base
@@ -240,27 +270,21 @@ void sendPacket() {
     rfm95WriteFifo(packet, totalLen);
     rfm95WriteReg(0x01, 0x83);      // LoRa + TX
 
-    // Wait for TxDone
     uint32_t txStart = millis();
     bool sent = false;
     while (millis() - txStart < 2000) {
         uint8_t irq = rfm95ReadReg(0x12);
         if (irq & 0x08) {
-            rfm95WriteReg(0x12, 0xFF);  // Clear IRQ
+            rfm95WriteReg(0x12, 0xFF);
             sent = true;
             break;
         }
         delay(1);
     }
 
-    // Back to sleep
     setModeSleep();
-
-    Serial.print(F("TX S:"));
-    Serial.print(txSequenceNum);
-    Serial.println(sent ? F(" OK") : F(" FAIL"));
-
     txSequenceNum++;
+    return sent;
 }
 
 // ============ BATTERY ============
@@ -272,13 +296,25 @@ uint16_t readBatteryMV() {
 
 // ============ SETUP ============
 void setup() {
+    pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, LOW);
+
     Serial.begin(115200);
     delay(2000);
     Serial.println(F("\n=== nRF52840 LoRa Node 115 (Low Power) ==="));
 
-    // LED indicator
-    pinMode(STATUS_LED, OUTPUT);
-    digitalWrite(STATUS_LED, LOW);
+    // OLED init (proven working pattern)
+    Wire.setPins(OLED_SDA, OLED_SCL);
+    Wire.begin();
+    delay(100);
+
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        oled_ok = true;
+    } else if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+        oled_ok = true;
+    }
+
+    oledStatus("INIT...", "LoRa P2P Node 115");
 
     // Enable low-power mode
     NRF_POWER->TASKS_LOWPWR = 1;
@@ -286,23 +322,40 @@ void setup() {
     // LoRa init
     lora_ok = initLoRa();
     if (!lora_ok) {
-        Serial.println(F("LoRa FAILED — halting"));
+        oledStatus("LoRa", "SPI FAIL!", "Check wiring");
+        Serial.println(F("LoRa FAILED"));
         while (1) delay(60000);
     }
 
-    Serial.println(F("Ready. TX every 60s."));
+    oledStatus("READY", "TX every 60s", lora_ok ? "LoRa: OK" : "LoRa: FAIL");
+    delay(2000);
 }
 
 // ============ LOOP ============
 void loop() {
     batteryMV = readBatteryMV();
 
-    // LED ON → TX → LED OFF (visual indicator)
+    // Show TX status on OLED
+    char txLine[22];
+    snprintf(txLine, sizeof(txLine), "TX #%d...", txSequenceNum);
+    oledStatus("TX", txLine);
+
+    // LED ON → TX → LED OFF
     digitalWrite(STATUS_LED, HIGH);
-    sendPacket();
+    lastTxOk = sendPacket();
     digitalWrite(STATUS_LED, LOW);
 
+    // Show result
+    char resultLine[22];
+    snprintf(resultLine, sizeof(resultLine), "S:%d %s", txSequenceNum - 1, lastTxOk ? "OK" : "FAIL");
+    char sleepLine[22];
+    snprintf(sleepLine, sizeof(sleepLine), "Sleep %ds...", TX_INTERVAL / 1000);
+    oledStatus("SLEEP", resultLine, sleepLine);
+
+    Serial.print(F("TX S:"));
+    Serial.print(txSequenceNum - 1);
+    Serial.println(lastTxOk ? F(" OK") : F(" FAIL"));
+
     // Deep sleep via FreeRTOS tickless idle (RTC1 + __WFE)
-    // CPU draws ~2-5 µA, RFM95 in sleep ~0.2 µA
     delay(TX_INTERVAL);
 }
