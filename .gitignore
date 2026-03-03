@@ -1,0 +1,19 @@
+.pio
+.vscode/
+.venv
+.claude
+*.bak
+*.log
+*.tmp.*
+*.uf2
+*.docx
+*.pyc
+Meshtastics_schematic/
+README_LoRa_P2P.md
+MESHTASTIC_PIN_ADAPTATION.md
+QUICK_START_MESHTASTIC.md
+SCHEMATIC_PIN_ANALYSIS.md
+STM32_TO_NRF52840_MAPPING.md
+UPLOAD_INSTRUCTIONS.md
+pinout.md
+*conflicted copy*
