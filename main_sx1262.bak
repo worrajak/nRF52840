@@ -1,14 +1,14 @@
 /*
- * nRF52840 LoRa P2P Node — Relay Hop + RFM95
- * Node ID: 117
+ * nRF52840 LoRa P2P Node — Relay Hop + SX1262
+ * Node ID: 116
  *
  * Protocol: RadioHead-compatible headers + XOR encryption + CRC16
- * Packet: [TO=0xFF][FROM=117][ID][FLAGS=hop_count][encrypted_payload+CRC16]
- * Payload: N:117|S:seq|T:temp|H:hum|B:bat
+ * Packet: [TO=0xFF][FROM=116][ID][FLAGS=hop_count][encrypted_payload+CRC16]
+ * Payload: N:116|S:seq|T:temp|H:hum|B:bat
  *
  * Debug OLED: scrolling log display + status lines
  * SPI: software bit-bang using nrf_gpio_* (n-able PINS_COUNT=34 bug)
- * LoRa: RFM95 (SX1276, register-based SPI)
+ * LoRa: SX1262 (command-based SPI)
  * BME280: optional — uses simulated values if not connected
  */
 
@@ -26,13 +26,14 @@
 #define OLED_SDA     36   // P1.04
 #define OLED_SCL     11   // P0.11
 
-// RFM95 LoRa SPI — raw GPIO numbers (nrf_gpio_* functions)
-#define RFM95_MISO   2    // P0.02
-#define RFM95_SCK    43   // P1.11
-#define RFM95_MOSI   47   // P1.15
-#define RFM95_CS     45   // P1.13
-#define RFM95_DIO0   29   // P0.29
-#define RFM95_RST    9    // P0.09
+// SX1262 LoRa SPI — raw GPIO numbers (nrf_gpio_* functions)
+#define SX1262_MISO  2    // P0.02
+#define SX1262_SCK   43   // P1.11
+#define SX1262_MOSI  47   // P1.15
+#define SX1262_CS    45   // P1.13
+#define SX1262_DIO1  29   // P0.29  (SX1262 uses DIO1 for IRQ, not DIO0)
+#define SX1262_RST   9    // P0.09
+#define SX1262_BUSY  40   // P1.08  (SX1262 has BUSY pin — ADJUST TO YOUR WIRING)
 
 // Battery
 #define BATTERY_PIN  31   // P0.31
@@ -56,6 +57,32 @@ static const char* CRYPTO_KEY = "1234567890000000";
 #define MESSAGE_QUEUE_SIZE    5
 #define RSSI_RELAY_THRESHOLD  -100
 #define RELAY_CACHE_TTL       300000  // 5 minutes
+
+// ============ SX1262 COMMAND OPCODES ============
+#define SX1262_CMD_SET_SLEEP            0x84
+#define SX1262_CMD_SET_STANDBY          0x80
+#define SX1262_CMD_SET_TX               0x83
+#define SX1262_CMD_SET_RX               0x82
+#define SX1262_CMD_SET_PACKET_TYPE      0x8A
+#define SX1262_CMD_SET_RF_FREQUENCY     0x86
+#define SX1262_CMD_SET_PA_CONFIG        0x95
+#define SX1262_CMD_SET_TX_PARAMS        0x8E
+#define SX1262_CMD_SET_MODULATION_PARAMS 0x8B
+#define SX1262_CMD_SET_PACKET_PARAMS    0x8C
+#define SX1262_CMD_SET_DIO_IRQ_PARAMS   0x08
+#define SX1262_CMD_CLEAR_IRQ_STATUS     0x02
+#define SX1262_CMD_GET_IRQ_STATUS       0x12
+#define SX1262_CMD_WRITE_BUFFER         0x0E
+#define SX1262_CMD_READ_BUFFER          0x1E
+#define SX1262_CMD_GET_RX_BUFFER_STATUS 0x13
+#define SX1262_CMD_GET_PACKET_STATUS    0x14
+#define SX1262_CMD_GET_STATUS           0xC0
+#define SX1262_CMD_SET_BUFFER_BASE_ADDR 0x8F
+#define SX1262_CMD_WRITE_REGISTER       0x0D
+#define SX1262_CMD_READ_REGISTER        0x1D
+#define SX1262_CMD_SET_DIO2_AS_RF_SWITCH 0x9D
+#define SX1262_CMD_SET_DIO3_AS_TCXO     0x97
+#define SX1262_CMD_CALIBRATE            0x89
 
 // ============ GLOBALS ============
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -173,48 +200,109 @@ static inline void gpioInput(uint32_t pin) {
 uint8_t swSpiTransfer(uint8_t data) {
     uint8_t recv = 0;
     for (int i = 7; i >= 0; i--) {
-        gpioWrite(RFM95_MOSI, (data >> i) & 1);
+        gpioWrite(SX1262_MOSI, (data >> i) & 1);
         delayMicroseconds(2);
-        gpioSet(RFM95_SCK);
+        gpioSet(SX1262_SCK);
         delayMicroseconds(2);
-        if (gpioRead(RFM95_MISO)) recv |= (1 << i);
-        gpioClear(RFM95_SCK);
+        if (gpioRead(SX1262_MISO)) recv |= (1 << i);
+        gpioClear(SX1262_SCK);
         delayMicroseconds(2);
     }
     return recv;
 }
 
-// ============ RFM95 REGISTER ACCESS ============
-uint8_t rfm95ReadReg(uint8_t addr) {
-    gpioClear(RFM95_CS);
-    delayMicroseconds(5);
-    swSpiTransfer(addr & 0x7F);
-    uint8_t value = swSpiTransfer(0x00);
-    delayMicroseconds(5);
-    gpioSet(RFM95_CS);
-    delayMicroseconds(5);
-    return value;
+// ============ SX1262 BUSY WAIT ============
+bool waitBusy(uint32_t timeoutMs = 100) {
+    uint32_t start = millis();
+    while (gpioRead(SX1262_BUSY)) {
+        if (millis() - start > timeoutMs) return false;
+        delayMicroseconds(100);
+    }
+    return true;
 }
 
-void rfm95WriteReg(uint8_t addr, uint8_t value) {
-    gpioClear(RFM95_CS);
+// ============ SX1262 COMMAND INTERFACE ============
+void sx1262Command(uint8_t cmd, const uint8_t* data, uint8_t len) {
+    waitBusy();
+    gpioClear(SX1262_CS);
     delayMicroseconds(5);
-    swSpiTransfer(addr | 0x80);
-    swSpiTransfer(value);
-    delayMicroseconds(5);
-    gpioSet(RFM95_CS);
-    delayMicroseconds(5);
-}
-
-void rfm95WriteFifo(const uint8_t* data, uint8_t len) {
-    gpioClear(RFM95_CS);
-    delayMicroseconds(5);
-    swSpiTransfer(0x00 | 0x80);
+    swSpiTransfer(cmd);
     for (uint8_t i = 0; i < len; i++) {
         swSpiTransfer(data[i]);
     }
     delayMicroseconds(5);
-    gpioSet(RFM95_CS);
+    gpioSet(SX1262_CS);
+    delayMicroseconds(5);
+}
+
+void sx1262ReadCommand(uint8_t cmd, uint8_t* data, uint8_t len) {
+    waitBusy();
+    gpioClear(SX1262_CS);
+    delayMicroseconds(5);
+    swSpiTransfer(cmd);
+    swSpiTransfer(0x00);  // SX1262 requires NOP after read command
+    for (uint8_t i = 0; i < len; i++) {
+        data[i] = swSpiTransfer(0x00);
+    }
+    delayMicroseconds(5);
+    gpioSet(SX1262_CS);
+    delayMicroseconds(5);
+}
+
+void sx1262WriteRegister(uint16_t addr, uint8_t value) {
+    waitBusy();
+    gpioClear(SX1262_CS);
+    delayMicroseconds(5);
+    swSpiTransfer(SX1262_CMD_WRITE_REGISTER);
+    swSpiTransfer((addr >> 8) & 0xFF);
+    swSpiTransfer(addr & 0xFF);
+    swSpiTransfer(value);
+    delayMicroseconds(5);
+    gpioSet(SX1262_CS);
+    delayMicroseconds(5);
+}
+
+uint8_t sx1262ReadRegister(uint16_t addr) {
+    waitBusy();
+    gpioClear(SX1262_CS);
+    delayMicroseconds(5);
+    swSpiTransfer(SX1262_CMD_READ_REGISTER);
+    swSpiTransfer((addr >> 8) & 0xFF);
+    swSpiTransfer(addr & 0xFF);
+    swSpiTransfer(0x00);  // NOP
+    uint8_t val = swSpiTransfer(0x00);
+    delayMicroseconds(5);
+    gpioSet(SX1262_CS);
+    delayMicroseconds(5);
+    return val;
+}
+
+void sx1262WriteBuffer(uint8_t offset, const uint8_t* data, uint8_t len) {
+    waitBusy();
+    gpioClear(SX1262_CS);
+    delayMicroseconds(5);
+    swSpiTransfer(SX1262_CMD_WRITE_BUFFER);
+    swSpiTransfer(offset);
+    for (uint8_t i = 0; i < len; i++) {
+        swSpiTransfer(data[i]);
+    }
+    delayMicroseconds(5);
+    gpioSet(SX1262_CS);
+    delayMicroseconds(5);
+}
+
+void sx1262ReadBuffer(uint8_t offset, uint8_t* data, uint8_t len) {
+    waitBusy();
+    gpioClear(SX1262_CS);
+    delayMicroseconds(5);
+    swSpiTransfer(SX1262_CMD_READ_BUFFER);
+    swSpiTransfer(offset);
+    swSpiTransfer(0x00);  // NOP
+    for (uint8_t i = 0; i < len; i++) {
+        data[i] = swSpiTransfer(0x00);
+    }
+    delayMicroseconds(5);
+    gpioSet(SX1262_CS);
     delayMicroseconds(5);
 }
 
@@ -248,19 +336,28 @@ uint16_t calculateCRC16(const uint8_t* data, uint8_t length) {
     return crc;
 }
 
-// ============ MODEM MODES ============
+// ============ SX1262 MODEM MODES ============
+void setModeStandby() {
+    uint8_t cfg = 0x00;  // STDBY_RC
+    sx1262Command(SX1262_CMD_SET_STANDBY, &cfg, 1);
+}
+
 void setModeRx() {
-    rfm95WriteReg(0x40, 0x00);     // DIO0 = RxDone
-    rfm95WriteReg(0x12, 0xFF);     // Clear IRQ
-    rfm95WriteReg(0x01, 0x85);     // LoRa + RX continuous
+    // Clear IRQ
+    uint8_t clr[] = {0xFF, 0xFF};
+    sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
+    // RX continuous (timeout = 0xFFFFFF)
+    uint8_t rx[] = {0xFF, 0xFF, 0xFF};
+    sx1262Command(SX1262_CMD_SET_RX, rx, 3);
 }
 
 void setModeSleep() {
-    rfm95WriteReg(0x01, 0x80);     // LoRa + Sleep
+    uint8_t cfg = 0x00;  // cold start, no RTC
+    sx1262Command(SX1262_CMD_SET_SLEEP, &cfg, 1);
 }
 
-// DIO0 interrupt handler
-void dio0_isr() {
+// DIO1 interrupt handler
+void dio1_isr() {
     lora_rx_flag = true;
 }
 
@@ -301,19 +398,40 @@ void addToMessageQueue(const uint8_t* packet, uint8_t len) {
 }
 
 void sendRawPacket(const uint8_t* packet, uint8_t len) {
-    rfm95WriteReg(0x01, 0x81);      // LoRa + Standby
-    delay(10);
-    rfm95WriteReg(0x0D, 0x00);
-    rfm95WriteReg(0x22, len);
-    rfm95WriteFifo(packet, len);
-    rfm95WriteReg(0x01, 0x83);      // LoRa + TX
+    setModeStandby();
+    delay(2);
 
+    // Set buffer base addresses
+    uint8_t bufBase[] = {0x00, 0x00};
+    sx1262Command(SX1262_CMD_SET_BUFFER_BASE_ADDR, bufBase, 2);
+
+    // Write payload to buffer
+    sx1262WriteBuffer(0x00, packet, len);
+
+    // Update packet params with new payload length
+    uint8_t pktParams[] = {
+        0x00, 0x08,  // preamble: 8 symbols
+        0x00,        // explicit header
+        len,         // payload length
+        0x01,        // CRC on
+        0x00         // standard IQ
+    };
+    sx1262Command(SX1262_CMD_SET_PACKET_PARAMS, pktParams, 6);
+
+    // Clear IRQ and TX
+    uint8_t clr[] = {0xFF, 0xFF};
+    sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
+    uint8_t tx[] = {0x00, 0x00, 0x00};  // no timeout
+    sx1262Command(SX1262_CMD_SET_TX, tx, 3);
+
+    // Wait for TxDone (IRQ bit 0)
     uint32_t txStart = millis();
     bool sent = false;
     while (millis() - txStart < 2000) {
-        uint8_t irq = rfm95ReadReg(0x12);
-        if (irq & 0x08) {
-            rfm95WriteReg(0x12, 0xFF);
+        uint8_t irq[2];
+        sx1262ReadCommand(SX1262_CMD_GET_IRQ_STATUS, irq, 2);
+        if (irq[0] & 0x01) {  // TxDone
+            sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
             sent = true;
             break;
         }
@@ -335,80 +453,121 @@ void processMessageQueue() {
     }
 }
 
-// ============ RFM95 MODEM CONFIG ============
+// ============ SX1262 MODEM CONFIG ============
 bool configureLoRaModem() {
-    rfm95WriteReg(0x01, 0x80);  // LoRa + Sleep
-    delay(10);
+    setModeStandby();
+    delay(5);
 
-    rfm95WriteReg(0x0E, 0x00);  // TX FIFO base
-    rfm95WriteReg(0x0F, 0x00);  // RX FIFO base
+    // Set packet type: LoRa
+    uint8_t pktType = 0x01;
+    sx1262Command(SX1262_CMD_SET_PACKET_TYPE, &pktType, 1);
 
-    // Frequency: 923 MHz
-    uint64_t frf = ((uint64_t)923000000 << 19) / 32000000;
-    rfm95WriteReg(0x06, (frf >> 16) & 0xFF);
-    rfm95WriteReg(0x07, (frf >> 8) & 0xFF);
-    rfm95WriteReg(0x08, frf & 0xFF);
+    // Set frequency: 923 MHz
+    // freq_reg = freq_hz * 2^25 / 32MHz
+    uint32_t freqReg = (uint32_t)((923000000.0 * (1 << 25)) / 32000000.0);
+    uint8_t freq[] = {
+        (uint8_t)(freqReg >> 24),
+        (uint8_t)(freqReg >> 16),
+        (uint8_t)(freqReg >> 8),
+        (uint8_t)(freqReg)
+    };
+    sx1262Command(SX1262_CMD_SET_RF_FREQUENCY, freq, 4);
 
-    rfm95WriteReg(0x1D, 0x72);  // BW=125kHz, CR=4/5
-    rfm95WriteReg(0x1E, 0x74);  // SF7, CRC on
+    // PA config: +14 dBm for SX1262
+    uint8_t paConfig[] = {0x04, 0x07, 0x00, 0x01};  // paDutyCycle, hpMax, deviceSel=SX1262, paLut
+    sx1262Command(SX1262_CMD_SET_PA_CONFIG, paConfig, 4);
 
-    // Preamble: 8 symbols
-    rfm95WriteReg(0x20, 0x00);
-    rfm95WriteReg(0x21, 0x08);
+    // TX params: power=14dBm, rampTime=200us
+    uint8_t txParams[] = {0x0E, 0x04};
+    sx1262Command(SX1262_CMD_SET_TX_PARAMS, txParams, 2);
 
-    rfm95WriteReg(0x39, 0x12);  // Sync word
-    rfm95WriteReg(0x09, 0x8C);  // TX power: 12 dBm, PA_BOOST
-    rfm95WriteReg(0x23, 0xFF);  // Max payload length
-    rfm95WriteReg(0x24, 0x00);  // No frequency hopping
-    rfm95WriteReg(0x40, 0x00);  // DIO0 = RxDone
+    // Modulation params: SF7, BW=125kHz, CR=4/5, LowDataRate=off
+    uint8_t modParams[] = {0x07, 0x04, 0x01, 0x00};
+    sx1262Command(SX1262_CMD_SET_MODULATION_PARAMS, modParams, 4);
+
+    // Packet params: preamble=8, explicit header, payload=MAX, CRC on, standard IQ
+    uint8_t pktParams[] = {0x00, 0x08, 0x00, 0xFF, 0x01, 0x00};
+    sx1262Command(SX1262_CMD_SET_PACKET_PARAMS, pktParams, 6);
+
+    // Set DIO2 as RF switch control (common on many SX1262 modules)
+    uint8_t dio2 = 0x01;
+    sx1262Command(SX1262_CMD_SET_DIO2_AS_RF_SWITCH, &dio2, 1);
+
+    // Set sync word for LoRa (0x1424 = public, 0x4434 = private)
+    // Using 0x1424 to match RadioHead default
+    sx1262WriteRegister(0x0740, 0x14);
+    sx1262WriteRegister(0x0741, 0x24);
+
+    // Set buffer base addresses
+    uint8_t bufBase[] = {0x00, 0x00};
+    sx1262Command(SX1262_CMD_SET_BUFFER_BASE_ADDR, bufBase, 2);
+
+    // DIO1 IRQ: RxDone + TxDone + CRC error
+    uint8_t irqParams[] = {
+        0x02, 0x03,  // IRQ mask: TxDone(0x01) + RxDone(0x02) + CRCErr(0x40) = 0x0243
+        0x02, 0x03,  // DIO1 mask (same)
+        0x00, 0x00,  // DIO2 mask (none)
+        0x00, 0x00   // DIO3 mask (none)
+    };
+    sx1262Command(SX1262_CMD_SET_DIO_IRQ_PARAMS, irqParams, 8);
 
     return true;
 }
 
 // ============ LORA INIT ============
 bool initLoRa() {
-    dbg("RFM95: init...");
+    dbg("SX1262: init...");
     updateOLED();
 
-    gpioOutput(RFM95_CS);
-    gpioSet(RFM95_CS);
-    gpioInput(RFM95_DIO0);
-    gpioOutput(RFM95_RST);
-    gpioSet(RFM95_RST);
+    gpioOutput(SX1262_CS);
+    gpioSet(SX1262_CS);
+    gpioInput(SX1262_DIO1);
+    gpioInput(SX1262_BUSY);
+    gpioOutput(SX1262_RST);
+    gpioSet(SX1262_RST);
     delay(10);
 
-    gpioOutput(RFM95_MOSI);
-    gpioOutput(RFM95_SCK);
-    gpioInput(RFM95_MISO);
-    gpioClear(RFM95_MOSI);
-    gpioClear(RFM95_SCK);
+    gpioOutput(SX1262_MOSI);
+    gpioOutput(SX1262_SCK);
+    gpioInput(SX1262_MISO);
+    gpioClear(SX1262_MOSI);
+    gpioClear(SX1262_SCK);
     delay(100);
 
-    // Reset RFM95
-    dbg("RFM95: reset...");
+    // Reset SX1262
+    dbg("SX1262: reset...");
     updateOLED();
-    gpioClear(RFM95_RST);
+    gpioClear(SX1262_RST);
     delay(10);
-    gpioSet(RFM95_RST);
+    gpioSet(SX1262_RST);
     delay(50);
 
-    uint8_t version = rfm95ReadReg(0x42);
-    dbgf("RFM95 ver: 0x%02X", version);
-    updateOLED();
-
-    if (version != 0x12) {
-        dbg("RFM95: not found!");
+    // Wait for BUSY to go low after reset
+    if (!waitBusy(500)) {
+        dbg("SX1262: BUSY timeout!");
         updateOLED();
         return false;
     }
 
+    // Check status — get device status
+    uint8_t status;
+    sx1262ReadCommand(SX1262_CMD_GET_STATUS, &status, 1);
+    dbgf("SX1262 status: 0x%02X", status);
+    updateOLED();
+
+    // Calibrate all blocks
+    uint8_t calMask = 0x7F;
+    sx1262Command(SX1262_CMD_CALIBRATE, &calMask, 1);
+    delay(10);
+    waitBusy(100);
+
     configureLoRaModem();
 
-    // Start RX continuous + DIO0 interrupt
+    // Start RX continuous + DIO1 interrupt
     setModeRx();
-    attachInterrupt(digitalPinToInterrupt(RFM95_DIO0), dio0_isr, RISING);
+    attachInterrupt(digitalPinToInterrupt(SX1262_DIO1), dio1_isr, RISING);
 
-    dbgf("RFM95: OK N:%d", THIS_NODE_ADDRESS);
+    dbgf("SX1262: OK N:%d", THIS_NODE_ADDRESS);
     updateOLED();
     return true;
 }
@@ -440,20 +599,37 @@ void sendPacket() {
     packet[3] = 0x00;  // hop count = 0 (origin)
     memcpy(&packet[4], encrypted, encLen);
 
-    // Standby → FIFO → TX
-    rfm95WriteReg(0x01, 0x81);
-    delay(10);
-    rfm95WriteReg(0x0D, 0x00);
-    rfm95WriteReg(0x22, totalLen);
-    rfm95WriteFifo(packet, totalLen);
-    rfm95WriteReg(0x01, 0x83);      // TX
+    // Standby → buffer → TX
+    setModeStandby();
+    delay(2);
+
+    uint8_t bufBase[] = {0x00, 0x00};
+    sx1262Command(SX1262_CMD_SET_BUFFER_BASE_ADDR, bufBase, 2);
+    sx1262WriteBuffer(0x00, packet, totalLen);
+
+    // Update packet params with payload length
+    uint8_t pktParams[] = {
+        0x00, 0x08,  // preamble: 8 symbols
+        0x00,        // explicit header
+        totalLen,    // payload length
+        0x01,        // CRC on
+        0x00         // standard IQ
+    };
+    sx1262Command(SX1262_CMD_SET_PACKET_PARAMS, pktParams, 6);
+
+    // Clear IRQ and start TX
+    uint8_t clr[] = {0xFF, 0xFF};
+    sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
+    uint8_t tx[] = {0x00, 0x00, 0x00};
+    sx1262Command(SX1262_CMD_SET_TX, tx, 3);
 
     uint32_t txStart = millis();
     bool sent = false;
     while (millis() - txStart < 2000) {
-        uint8_t irq = rfm95ReadReg(0x12);
-        if (irq & 0x08) {
-            rfm95WriteReg(0x12, 0xFF);
+        uint8_t irq[2];
+        sx1262ReadCommand(SX1262_CMD_GET_IRQ_STATUS, irq, 2);
+        if (irq[0] & 0x01) {  // TxDone
+            sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
             sent = true;
             break;
         }
@@ -477,37 +653,50 @@ void receivePacket() {
     if (!lora_ok || !lora_rx_flag) return;
     lora_rx_flag = false;
 
-    uint8_t irqFlags = rfm95ReadReg(0x12);
+    // Get IRQ status
+    uint8_t irq[2];
+    sx1262ReadCommand(SX1262_CMD_GET_IRQ_STATUS, irq, 2);
 
-    // Check RxDone and no CRC error
-    if (!(irqFlags & 0x40) || (irqFlags & 0x20)) {
-        rfm95WriteReg(0x12, 0xFF);
+    // Check RxDone (bit 1) and no CRC error (bit 6)
+    if (!(irq[0] & 0x02)) {
+        uint8_t clr[] = {0xFF, 0xFF};
+        sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
+        setModeRx();
+        return;
+    }
+    if (irq[0] & 0x40) {
+        dbg("RX: CRC hw fail!");
+        uint8_t clr[] = {0xFF, 0xFF};
+        sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
         setModeRx();
         return;
     }
 
-    uint8_t rxLen = rfm95ReadReg(0x13);
-    uint8_t fifoAddr = rfm95ReadReg(0x10);
-    rfm95WriteReg(0x0D, fifoAddr);
+    // Get RX buffer status (payload length + start offset)
+    uint8_t rxBufStatus[2];
+    sx1262ReadCommand(SX1262_CMD_GET_RX_BUFFER_STATUS, rxBufStatus, 2);
+    uint8_t rxLen = rxBufStatus[0];
+    uint8_t rxOffset = rxBufStatus[1];
 
     if (rxLen < 7 || rxLen > MAX_MESSAGE_LEN) {
-        rfm95WriteReg(0x12, 0xFF);
+        uint8_t clr[] = {0xFF, 0xFF};
+        sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
         setModeRx();
         return;
     }
 
+    // Read packet from buffer
     uint8_t packet[rxLen];
-    gpioClear(RFM95_CS);
-    delayMicroseconds(5);
-    swSpiTransfer(0x00);
-    for (uint8_t i = 0; i < rxLen; i++) {
-        packet[i] = swSpiTransfer(0x00);
-    }
-    delayMicroseconds(5);
-    gpioSet(RFM95_CS);
-    delayMicroseconds(5);
+    sx1262ReadBuffer(rxOffset, packet, rxLen);
 
-    int16_t rssi = rfm95ReadReg(0x1A) - 157;
+    // Get RSSI from packet status
+    uint8_t pktStatus[3];
+    sx1262ReadCommand(SX1262_CMD_GET_PACKET_STATUS, pktStatus, 3);
+    int16_t rssi = -(int16_t)pktStatus[0] / 2;
+
+    // Clear IRQ
+    uint8_t clr[] = {0xFF, 0xFF};
+    sx1262Command(SX1262_CMD_CLEAR_IRQ_STATUS, clr, 2);
 
     // Parse RadioHead header
     uint8_t rhTo    = packet[0];
@@ -516,14 +705,12 @@ void receivePacket() {
     uint8_t hopCount = rhFlags & 0x0F;
 
     if (rhTo != BROADCAST_ADDRESS && rhTo != THIS_NODE_ADDRESS) {
-        rfm95WriteReg(0x12, 0xFF);
         setModeRx();
         return;
     }
 
     uint8_t dataLen = rxLen - 4;
     if (dataLen < 3) {
-        rfm95WriteReg(0x12, 0xFF);
         setModeRx();
         return;
     }
@@ -535,7 +722,6 @@ void receivePacket() {
 
     if (receivedCRC != calcCRC) {
         dbg("RX: CRC fail!");
-        rfm95WriteReg(0x12, 0xFF);
         setModeRx();
         updateOLED();
         return;
@@ -593,7 +779,6 @@ void receivePacket() {
 
     // ---- Relay logic ----
     // Guard: skip if this is our own data (echo from another relay)
-    // Check both payload N: field AND RadioHead FROM header
     if (srcNode == THIS_NODE_ADDRESS || rhFrom == THIS_NODE_ADDRESS) {
         dbgf("RX: own echo N:%d skip", srcNode);
     } else if (srcNode == 0) {
@@ -622,7 +807,6 @@ void receivePacket() {
         }
     }
 
-    rfm95WriteReg(0x12, 0xFF);
     setModeRx();
     updateOLED();
 }
@@ -654,7 +838,7 @@ void setup() {
 
     Serial.begin(115200);
     delay(2000);
-    Serial.println(F("\n=== nRF52840 LoRa P2P Node 117 (RFM95) ==="));
+    Serial.println(F("\n=== nRF52840 LoRa P2P Node 116 (SX1262) ==="));
 
     // I2C
     Wire.setPins(OLED_SDA, OLED_SCL);
@@ -677,13 +861,13 @@ void setup() {
         display.setTextSize(2);
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 0);
-        display.println(F("Node 117"));
+        display.println(F("Node 116"));
         display.setTextSize(1);
-        display.println(F("RFM95 init..."));
+        display.println(F("SX1262 init..."));
         display.display();
     }
 
-    dbg("=== Node 117 ===");
+    dbg("=== Node 116 ===");
     dbg(oled_ok ? "OLED: OK" : "OLED: FAIL!");
     updateOLED();
 
@@ -711,7 +895,7 @@ void setup() {
     // LoRa init
     lora_ok = initLoRa();
     if (!lora_ok) {
-        dbg("RFM95: FAILED!");
+        dbg("SX1262: FAILED!");
     }
     updateOLED();
 

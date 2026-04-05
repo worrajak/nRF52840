@@ -5,11 +5,14 @@ LoRa P2P sensor node on **Pro Micro nRF52840 (NiceNano)** compatible with STM32 
 ## Features
 
 - RadioHead-compatible packet format (interoperable with STM32 nodes using RH_RF95)
+- **Multi-hop relay** with duplicate detection, echo prevention, and message queue
 - XOR encryption + CRC16 (matches STM32 network protocol)
-- SSD1306 OLED display (128x64, I2C)
-- Software bit-bang SPI for RFM95 (bypasses n-able core PINS_COUNT=34 bug)
+- BME280 temperature/humidity sensor (auto-detect, simulated fallback)
+- SSD1306 OLED display (128x64, I2C) with status + scrolling debug log
+- Software bit-bang SPI for LoRa module (bypasses n-able core PINS_COUNT=34 bug)
 - Battery voltage monitoring
 - Broadcast TX every 30 seconds, continuous RX
+- Supports **RFM95 (SX1276)** and **SX1262** modules (separate backup files)
 
 ## Hardware
 
@@ -71,7 +74,7 @@ Pro Micro nRF52840          SSD1306 OLED
 | Sync Word | 0x12 |
 | TX Power | 12 dBm (PA_BOOST) |
 | Preamble | 8 symbols |
-| Node ID | 115 |
+| Node ID | 116 (configurable) |
 
 ## Protocol
 
@@ -79,29 +82,37 @@ Pro Micro nRF52840          SSD1306 OLED
 
 ```
 [Preamble][SyncWord][Length][ RadioHead Header (4 bytes) ][ Encrypted Payload ][ CRC16 ][ HW CRC ]
-                            [ TO ][ FROM ][ ID ][ FLAGS ]
-                            [0xFF][ 115  ][ seq][  0x00 ]
+                            [ TO ][ FROM ][ ID ][ FLAGS    ]
+                            [0xFF][ 116  ][ seq][ hop_count]
 ```
 
 - **TO**: 0xFF (broadcast) or destination node ID
-- **FROM**: sender node ID (115)
+- **FROM**: sender node ID (116) — relay changes this to relay node ID
 - **ID**: sequence number (auto-increment)
-- **FLAGS**: 0x00 (no ACK for broadcast)
+- **FLAGS**: lower 4 bits = hop count (0 = origin, incremented per relay)
 
 ### Payload Format
 
 Plaintext before encryption:
 ```
-N:115|S:0|T:28|H:65|B:3300
+N:116|S:0|T:28|H:65|B:3300
 ```
 
 | Field | Description |
 |-------|-------------|
-| N | Node ID |
+| N | Original source node ID (preserved through relay) |
 | S | Sequence number |
-| T | Temperature (placeholder) |
-| H | Humidity (placeholder) |
+| T | Temperature (°C, from BME280 or simulated) |
+| H | Humidity (%, from BME280 or simulated) |
 | B | Battery voltage (mV) |
+
+### Relay / Multi-Hop
+
+- Relay triggers when RSSI <= -100 dBm and hop count < 3
+- Duplicate detection: source node + sequence number cache (TTL 5 min)
+- Echo prevention: skip packets where payload `N:` or header `FROM` matches own ID
+- Queued forwarding with random delay (1-3s) to reduce collisions
+- OLED shows: `FWD N:42 T:30 H:60%` + hop/RSSI details
 
 ### Encryption
 
@@ -145,12 +156,21 @@ nrf_gpio_pin_read(pin);     // instead of digitalRead(pin)
 
 ```
 ├── src/
-│   └── main.cpp              # Main firmware
-├── include/
-│   └── lora_config.h         # LoRa config structures & crypto key
+│   └── main.cpp              # Main firmware (current: RFM95 + relay)
+├── main_rfm95.bak            # Backup: RFM95 (SX1276) version
+├── main_sx1262.bak           # Backup: SX1262 version (command-based SPI)
 ├── platformio.ini             # PlatformIO build config
 └── README.md
 ```
+
+## SX1262 Version
+
+A backup for **SX1262** module is provided in `main_sx1262.bak`:
+- Command-based SPI (vs register-based for RFM95)
+- Requires additional **BUSY** pin (adjust `SX1262_BUSY` define)
+- Uses **DIO1** instead of DIO0 for IRQ
+- Auto-calibration after reset
+- Same protocol, encryption, relay logic — interoperable with RFM95 nodes
 
 ## STM32 Compatibility
 
@@ -159,7 +179,7 @@ This node is fully compatible with the STM32 LoRa P2P network:
 - Same RadioHead header format (4-byte header)
 - Same XOR encryption with shared key
 - Same CRC16 algorithm and byte order
-- STM32 nodes see this as `[RX from:115]` in their serial output
+- Relay preserves original payload — STM32 gateway sees original `N:` source
 
 ## License
 
