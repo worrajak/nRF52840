@@ -24,8 +24,8 @@
 
 // ============ RADIO MODULE SELECTION ============
 // เลือก module โดย uncomment อันที่ใช้ (เลือกได้อันเดียว)
-//#define USE_SX1262          // SX1262 module (command-based SPI, DIO1+BUSY)
-#define USE_RFM95         // RFM95/SX1276 module (register-based SPI, DIO0)
+#define USE_SX1262          // SX1262 module (command-based SPI, DIO1+BUSY)
+//#define USE_RFM95         // RFM95/SX1276 module (register-based SPI, DIO0)
 
 // ============ PIN DEFINITIONS ============
 #define STATUS_LED   15   // P0.15
@@ -59,7 +59,7 @@
 #define REAL_VBAT_MV_PER_LSB (VBAT_DIVIDER_COMP * VBAT_MV_PER_LSB)
 
 // ============ NETWORK CONFIG ============
-#define THIS_NODE_ADDRESS  116
+#define THIS_NODE_ADDRESS  119
 #define BROADCAST_ADDRESS  0xFF
 #define MAX_MESSAGE_LEN    251
 #define TX_INTERVAL        30000  // 30 seconds
