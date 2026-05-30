@@ -4,15 +4,17 @@ LoRa P2P sensor node on **Pro Micro nRF52840 (NiceNano)** compatible with STM32 
 
 ## Features
 
+- **Dual radio support**: SX1262 and RFM95/SX1276 — switch via `#define` at compile time
 - RadioHead-compatible packet format (interoperable with STM32 nodes using RH_RF95)
 - **Multi-hop relay** with duplicate detection, echo prevention, and message queue
+- **BLE GPS**: receive GPS coordinates from phone app, include in LoRa payload
+- **Node tracking**: OLED shows distance/direction to other nodes with compass arrow
 - XOR encryption + CRC16 (matches STM32 network protocol)
 - BME280 temperature/humidity sensor (auto-detect, simulated fallback)
-- SSD1306 OLED display (128x64, I2C) with status + scrolling debug log
+- SSD1306 OLED display (128x64, I2C) with status, GPS info, and debug log
 - Software bit-bang SPI for LoRa module (bypasses n-able core PINS_COUNT=34 bug)
 - Battery voltage monitoring
 - Broadcast TX every 30 seconds, continuous RX
-- Supports **RFM95 (SX1276)** and **SX1262** modules (separate backup files)
 
 ## Hardware
 
@@ -26,12 +28,13 @@ LoRa P2P sensor node on **Pro Micro nRF52840 (NiceNano)** compatible with STM32 
 |----------|-----|------|-------|
 | **OLED SDA** | P1.04 | 36 | I2C Data |
 | **OLED SCL** | P0.11 | 11 | I2C Clock |
-| **RFM95 MISO** | P0.02 | 2 | SPI Master In |
-| **RFM95 SCK** | P1.11 | 43 | SPI Clock (Port 1!) |
-| **RFM95 MOSI** | P1.15 | 47 | SPI Master Out (Port 1!) |
-| **RFM95 CS** | P1.13 | 45 | SPI Chip Select (Port 1!) |
-| **RFM95 DIO0** | P0.29 | 29 | LoRa RX interrupt |
-| **RFM95 RST** | P0.09 | 9 | Module reset |
+| **LoRa MISO** | P0.02 | 2 | SPI Master In |
+| **LoRa SCK** | P1.11 | 43 | SPI Clock (Port 1!) |
+| **LoRa MOSI** | P1.15 | 47 | SPI Master Out (Port 1!) |
+| **LoRa CS** | P1.13 | 45 | SPI Chip Select (Port 1!) |
+| **LoRa IRQ** | P0.29 | 29 | DIO0 (RFM95) or DIO1 (SX1262) |
+| **LoRa RST** | P0.09 | 9 | Module reset |
+| **LoRa BUSY** | P0.03 | 3 | SX1262 only |
 | **Status LED** | P0.15 | 15 | Onboard LED |
 | **Battery** | P0.31 | 31 | ADC battery voltage |
 
@@ -42,14 +45,15 @@ LoRa P2P sensor node on **Pro Micro nRF52840 (NiceNano)** compatible with STM32 
 ### Wiring Diagram
 
 ```
-Pro Micro nRF52840          RFM95W
+Pro Micro nRF52840          RFM95W / SX1262
 ┌──────────┐              ┌──────────┐
 │    P0.02 ├──────────────┤ MISO     │
 │    P1.11 ├──────────────┤ SCK      │
 │    P1.15 ├──────────────┤ MOSI     │
 │    P1.13 ├──────────────┤ NSS (CS) │
-│    P0.29 ├──────────────┤ DIO0     │
+│    P0.29 ├──────────────┤ DIO0/DIO1│
 │    P0.09 ├──────────────┤ RST      │
+│    P0.03 ├──────────────┤ BUSY     │  ← SX1262 only
 │      3V3 ├──────────────┤ VCC      │
 │      GND ├──────────────┤ GND      │
 └──────────┘              └──────────┘
@@ -95,7 +99,7 @@ Pro Micro nRF52840          SSD1306 OLED
 
 Plaintext before encryption:
 ```
-N:116|S:0|T:28|H:65|B:3300
+N:116|S:0|T:28|H:65|B:3300|LA:13.736717|LO:100.523186
 ```
 
 | Field | Description |
@@ -105,6 +109,8 @@ N:116|S:0|T:28|H:65|B:3300
 | T | Temperature (°C, from BME280 or simulated) |
 | H | Humidity (%, from BME280 or simulated) |
 | B | Battery voltage (mV) |
+| LA | Latitude (from BLE GPS, optional) |
+| LO | Longitude (from BLE GPS, optional) |
 
 ### Relay / Multi-Hop
 
@@ -152,25 +158,31 @@ nrf_gpio_pin_read(pin);     // instead of digitalRead(pin)
 - Do NOT call `i2cDevicePresent()` before `display.begin()` -- corrupts I2C bus
 - Must have `delay(2000)` after `Serial.begin()` for power stabilization
 
+## Radio Module Selection
+
+Both **SX1262** and **RFM95 (SX1276)** are supported in a single firmware. Switch by editing the `#define` at the top of `src/main.cpp`:
+
+```cpp
+// เลือก module โดย uncomment อันที่ใช้ (เลือกได้อันเดียว)
+//#define USE_SX1262          // SX1262 module (command-based SPI, DIO1+BUSY)
+#define USE_RFM95         // RFM95/SX1276 module (register-based SPI, DIO0)
+```
+
+| | RFM95 (SX1276) | SX1262 |
+|---|---|---|
+| SPI protocol | Register-based | Command-based |
+| Interrupt pin | DIO0 | DIO1 |
+| BUSY pin | Not needed | Required (P0.03) |
+| Max TX power | +20 dBm | +22 dBm |
+
 ## Project Structure
 
 ```
 ├── src/
-│   └── main.cpp              # Main firmware (current: RFM95 + relay)
-├── main_rfm95.bak            # Backup: RFM95 (SX1276) version
-├── main_sx1262.bak           # Backup: SX1262 version (command-based SPI)
+│   └── main.cpp              # Main firmware (SX1262/RFM95 + BLE GPS + relay)
 ├── platformio.ini             # PlatformIO build config
 └── README.md
 ```
-
-## SX1262 Version
-
-A backup for **SX1262** module is provided in `main_sx1262.bak`:
-- Command-based SPI (vs register-based for RFM95)
-- Requires additional **BUSY** pin (adjust `SX1262_BUSY` define)
-- Uses **DIO1** instead of DIO0 for IRQ
-- Auto-calibration after reset
-- Same protocol, encryption, relay logic — interoperable with RFM95 nodes
 
 ## STM32 Compatibility
 
