@@ -1,0 +1,15 @@
+{
+  "useMarkdownLinks": false,
+  "showUnsupportedFiles": false,
+  "newFileLocation": "folder",
+  "newFileFolderPath": "0_Inbox",
+  "attachmentFolderPath": "3_Resources/Refs",
+  "spellcheck": false,
+  "spellcheckLanguages": ["th", "en"],
+  "legacyEditor": false,
+  "livePreview": true,
+  "defaultViewMode": "source",
+  "readableLineLength": true,
+  "strictLineBreaks": false,
+  "showFrontmatter": false
+}

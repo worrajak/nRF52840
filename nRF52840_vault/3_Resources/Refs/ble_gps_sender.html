@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LoRa BLE GPS Sender</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e; color: #eee; padding: 16px;
+    max-width: 480px; margin: 0 auto;
+}
+h1 { font-size: 1.3em; text-align: center; margin-bottom: 12px; color: #00d4ff; }
+.card {
+    background: #16213e; border-radius: 12px; padding: 16px;
+    margin-bottom: 12px; border: 1px solid #0f3460;
+}
+.card h2 { font-size: 1em; color: #00d4ff; margin-bottom: 8px; }
+.status { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #555; flex-shrink: 0;
+}
+.dot.on { background: #00ff88; }
+.dot.warn { background: #ffaa00; }
+.dot.off { background: #ff4444; }
+.value { font-size: 1.4em; font-weight: bold; color: #fff; }
+.label { font-size: 0.85em; color: #888; }
+.row { display: flex; gap: 12px; margin: 6px 0; }
+.row > div { flex: 1; }
+button {
+    width: 100%; padding: 14px; border: none; border-radius: 10px;
+    font-size: 1.1em; font-weight: bold; cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-connect { background: #0f3460; color: #00d4ff; }
+.btn-connect:hover { background: #1a4a7a; }
+.btn-connect.connected { background: #004d40; color: #00ff88; }
+.btn-disconnect { background: #3d0000; color: #ff4444; margin-top: 8px; }
+.btn-disconnect:hover { background: #5d0000; }
+select, input {
+    width: 100%; padding: 10px; border-radius: 8px;
+    border: 1px solid #0f3460; background: #1a1a2e; color: #eee;
+    font-size: 1em;
+}
+.log {
+    background: #0d1117; border-radius: 8px; padding: 10px;
+    font-family: monospace; font-size: 0.8em; color: #8b949e;
+    max-height: 120px; overflow-y: auto; white-space: pre-wrap;
+}
+.compass {
+    width: 80px; height: 80px; margin: 0 auto;
+    position: relative;
+}
+.compass canvas { width: 80px; height: 80px; }
+</style>
+</head>
+<body>
+
+<h1>LoRa BLE GPS Sender</h1>
+
+<!-- BLE Connection -->
+<div class="card">
+    <h2>BLE Connection</h2>
+    <div class="status">
+        <div class="dot" id="bleDot"></div>
+        <span id="bleStatus">Disconnected</span>
+    </div>
+    <button class="btn-connect" id="btnConnect" onclick="toggleBLE()">
+        Connect to LoRa Node
+    </button>
+    <button class="btn-disconnect" id="btnDisconnect" onclick="disconnectBLE()" style="display:none">
+        Disconnect
+    </button>
+</div>
+
+<!-- GPS Status -->
+<div class="card">
+    <h2>GPS Position</h2>
+    <div class="status">
+        <div class="dot" id="gpsDot"></div>
+        <span id="gpsStatus">Waiting for GPS...</span>
+    </div>
+    <div class="row">
+        <div>
+            <div class="label">Latitude</div>
+            <div class="value" id="lat">--</div>
+        </div>
+        <div>
+            <div class="label">Longitude</div>
+            <div class="value" id="lon">--</div>
+        </div>
+    </div>
+    <div class="row">
+        <div>
+            <div class="label">Accuracy</div>
+            <div id="accuracy">--</div>
+        </div>
+        <div>
+            <div class="label">Heading</div>
+            <div id="heading">--</div>
+        </div>
+        <div>
+            <div class="label">Speed</div>
+            <div id="speed">--</div>
+        </div>
+    </div>
+</div>
+
+<!-- Send Settings -->
+<div class="card">
+    <h2>Auto Send</h2>
+    <div class="row">
+        <div>
+            <div class="label">Interval</div>
+            <select id="interval" onchange="restartAutoSend()">
+                <option value="2000">2 sec</option>
+                <option value="5000" selected>5 sec</option>
+                <option value="10000">10 sec</option>
+                <option value="30000">30 sec</option>
+            </select>
+        </div>
+        <div>
+            <div class="label">Sends / Last</div>
+            <div id="sendCount">0 sends</div>
+            <div id="lastSend" class="label">--</div>
+        </div>
+    </div>
+</div>
+
+<!-- Log -->
+<div class="card">
+    <h2>Log</h2>
+    <div class="log" id="log"></div>
+</div>
+
+<script>
+// BLE UUIDs — must match firmware
+const SERVICE_UUID  = '12345678-1234-1234-1234-123456789abc';
+const CHAR_UUID     = '12345678-1234-1234-1234-123456789abd';
+
+let bleDevice = null;
+let bleChar = null;
+let gpsWatchId = null;
+let autoSendTimer = null;
+let sendCount = 0;
+
+let currentLat = 0;
+let currentLon = 0;
+let currentHeading = -1;
+let gpsReady = false;
+
+// ============ LOG ============
+function log(msg) {
+    const el = document.getElementById('log');
+    const time = new Date().toLocaleTimeString('th-TH');
+    el.textContent += `[${time}] ${msg}\n`;
+    el.scrollTop = el.scrollHeight;
+}
+
+// ============ BLE ============
+async function toggleBLE() {
+    if (bleDevice && bleDevice.gatt.connected) return;
+    try {
+        log('Scanning BLE...');
+        bleDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'LoRa-' }],
+            optionalServices: [SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        log('Connecting to ' + bleDevice.name + '...');
+        const server = await bleDevice.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        bleChar = await service.getCharacteristic(CHAR_UUID);
+
+        log('Connected! Ready to send GPS.');
+        updateBLEStatus(true);
+        startGPS();
+        startAutoSend();
+    } catch (e) {
+        log('BLE error: ' + e.message);
+        updateBLEStatus(false);
+    }
+}
+
+function onDisconnected() {
+    log('BLE disconnected');
+    bleChar = null;
+    updateBLEStatus(false);
+    stopAutoSend();
+}
+
+async function disconnectBLE() {
+    stopAutoSend();
+    if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+    }
+    bleChar = null;
+    updateBLEStatus(false);
+    log('Disconnected.');
+}
+
+function updateBLEStatus(connected) {
+    const dot = document.getElementById('bleDot');
+    const status = document.getElementById('bleStatus');
+    const btn = document.getElementById('btnConnect');
+    const btnDc = document.getElementById('btnDisconnect');
+    if (connected) {
+        dot.className = 'dot on';
+        status.textContent = 'Connected: ' + (bleDevice?.name || '');
+        btn.textContent = 'Connected';
+        btn.classList.add('connected');
+        btnDc.style.display = 'block';
+    } else {
+        dot.className = 'dot off';
+        status.textContent = 'Disconnected';
+        btn.textContent = 'Connect to LoRa Node';
+        btn.classList.remove('connected');
+        btnDc.style.display = 'none';
+    }
+}
+
+// ============ GPS ============
+function startGPS() {
+    if (gpsWatchId !== null) return;
+    if (!navigator.geolocation) {
+        log('Geolocation not supported!');
+        return;
+    }
+    gpsWatchId = navigator.geolocation.watchPosition(
+        onGPSUpdate,
+        onGPSError,
+        { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 }
+    );
+    log('GPS started (high accuracy)');
+}
+
+function onGPSUpdate(pos) {
+    currentLat = pos.coords.latitude;
+    currentLon = pos.coords.longitude;
+    if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) {
+        currentHeading = pos.coords.heading;
+    }
+    gpsReady = true;
+
+    document.getElementById('gpsDot').className = 'dot on';
+    document.getElementById('gpsStatus').textContent = 'Active';
+    document.getElementById('lat').textContent = currentLat.toFixed(6);
+    document.getElementById('lon').textContent = currentLon.toFixed(6);
+    document.getElementById('accuracy').textContent =
+        pos.coords.accuracy ? pos.coords.accuracy.toFixed(0) + ' m' : '--';
+    document.getElementById('heading').textContent =
+        currentHeading >= 0 ? currentHeading.toFixed(0) + '°' : '--';
+    document.getElementById('speed').textContent =
+        pos.coords.speed !== null ? (pos.coords.speed * 3.6).toFixed(1) + ' km/h' : '--';
+}
+
+function onGPSError(err) {
+    document.getElementById('gpsDot').className = 'dot warn';
+    document.getElementById('gpsStatus').textContent = 'Error: ' + err.message;
+    log('GPS error: ' + err.message);
+}
+
+// ============ AUTO SEND ============
+function startAutoSend() {
+    stopAutoSend();
+    const ms = parseInt(document.getElementById('interval').value);
+    autoSendTimer = setInterval(sendGPS, ms);
+    log('Auto-send every ' + (ms / 1000) + 's');
+}
+
+function stopAutoSend() {
+    if (autoSendTimer) {
+        clearInterval(autoSendTimer);
+        autoSendTimer = null;
+    }
+}
+
+function restartAutoSend() {
+    if (bleChar && bleDevice?.gatt.connected) {
+        startAutoSend();
+    }
+}
+
+async function sendGPS() {
+    if (!bleChar || !gpsReady) return;
+    try {
+        let data;
+        if (currentHeading >= 0) {
+            data = `${currentLat.toFixed(6)},${currentLon.toFixed(6)},${currentHeading.toFixed(1)}`;
+        } else {
+            data = `${currentLat.toFixed(6)},${currentLon.toFixed(6)}`;
+        }
+
+        const encoder = new TextEncoder();
+        await bleChar.writeValueWithoutResponse(encoder.encode(data));
+
+        sendCount++;
+        document.getElementById('sendCount').textContent = sendCount + ' sends';
+        document.getElementById('lastSend').textContent = new Date().toLocaleTimeString('th-TH');
+    } catch (e) {
+        log('Send error: ' + e.message);
+    }
+}
+
+// Start GPS immediately on load (will ask permission)
+if (navigator.geolocation) {
+    document.getElementById('gpsStatus').textContent = 'Tap Connect to start';
+}
+</script>
+
+</body>
+</html>
