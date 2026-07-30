@@ -109,8 +109,15 @@ static const char* CRYPTO_KEY = "1234567890000000";
 #define RSSI_EMA_ALPHA_NUM    3     // EMA numerator   (α = 0.3)
 #define RSSI_EMA_ALPHA_DEN    10    // EMA denominator
 
-// ML mode toggle
-bool mlMode = true;
+// ML mode toggle — default OFF: the shipped weights are not discriminative yet.
+// Host-replaying include/rssi_classifier.h over its own training range gives
+// prob 0.506–0.678 for *every* input (all ≥ 0.5 → "relay"), and the ordering is
+// inverted (rssi -47 close → 0.506, rssi -110 far → 0.647). With mlMode = true
+// the adaptive-EMA suppression below could therefore never fire, so the default
+// build silently relayed everything. Rule mode is deterministic and testable;
+// flip ML on with the serial toggle (or set true here) after retraining with
+// tools/train_model.py and confirming it separates relay / no-relay.
+bool mlMode = false;
 uint8_t mlProbPct = 50;  // last ML probability in % (0-100)
 
 // Path success rate (Bayesian)

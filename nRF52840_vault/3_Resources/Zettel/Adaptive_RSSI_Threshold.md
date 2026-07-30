@@ -27,11 +27,11 @@ new_threshold = (1-α) × old_threshold + α × sample_rssi
 - ปรับอัตโนมัติเมื่อสภาพแวดล้อมเปลี่ยน (กลางวัน/กลางคืน, ฝนตก, มีสิ่งกีดขวางใหม่)
 - ไม่ต้อง calibrate threshold ล่วงหน้า
 - ใช้ RAM แค่ 6 bytes (int16_t + uint32_t)
-- **Fallback เมื่อ ML OFF** — ถ้าใช้ ML mode (default) threshold ยังคง update แต่ไม่ใช้ตัดสินใจ
+- **เป็นตัวตัดสินใจหลัก (default ตั้งแต่ 2026-07-30)** — `mlMode=false` · ตอน ML ON threshold ยัง update แต่ไม่ใช้ตัดสิน
 
 ## Links
 
-- [[TFLite_Integration]] — ML mode (default) ใช้ NN แทน threshold
+- [[TFLite_Integration]] — ML mode (**opt-in** ผ่าน `MLON`) ใช้ NN แทน threshold · ก่อนหน้านี้ default ON ด้วยน้ำหนักที่ตอบ "relay" ทุกเคส ทำให้ threshold นี้ไม่ได้ทำงานจริงในบิลด์ default
 - [[RSSI_Forwarding_Delay]]
 - [[_project-brief]]
 

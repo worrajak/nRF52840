@@ -1,6 +1,17 @@
 #ifndef RSSI_CLASSIFIER_H
 #define RSSI_CLASSIFIER_H
 
+// ⚠️ STALE / NOT COMPILED — safe to delete.
+// Left over from the old tools/train_model.py, which wrote a TFLite byte array
+// into the current directory.  The firmware compiles include/rssi_classifier.h
+// (inline weights + forward pass) and no code ever referenced the array below,
+// so retraining used to have no effect on the device.  train_model.py now
+// writes include/rssi_classifier.h directly.
+// Keeping a second header with the SAME name is a shadowing hazard: add -I. to
+// the build and #include "rssi_classifier.h" resolves here instead, where
+// mlPredictRelay() does not exist.
+// A copy is archived at nRF52840_vault/3_Resources/Refs/rssi_classifier.h.
+
 // Auto-generated TFLite model for RSSI classification
 // Input: [rssi, hop, src] normalized
 // Output: probability (0-1) of should_relay
