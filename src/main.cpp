@@ -22,6 +22,7 @@
 #include <NimBLEDevice.h>
 #include <math.h>
 #include "rssi_classifier.h"
+#include "meas.h"          // [MEAS] โหมดวัด propagation — เปิดด้วย -DFW_MEAS_MODE
 
 // ============ RADIO MODULE SELECTION ============
 // PlatformIO defines one of these from custom_radio in platformio.ini.
@@ -96,9 +97,43 @@ static const char* CRYPTO_KEY = "1234567890000000";
 #define RELAY_CACHE_TTL       300000  // 5 minutes
 
 // FLAGS bits in RadioHead header byte [3]
+// nibble ล่าง = RH_FLAGS_APPLICATION_SPECIFIC ของ RadioHead -> ปลอดภัยสำหรับ hop count
 #define FLAG_HOP_MASK         0x0F
 #define FLAG_IS_ACK           (1 << 4)
 #define FLAG_ACK_REQ          (1 << 5)
+
+// VIA trace: ต่อ "|V:<relay_id>,<rssi>" ท้าย payload ทุกครั้งที่ทวน
+// rssi = ค่าที่ node นี้ได้ยิน hop ก่อนหน้า -> gateway ถอดเส้นทางเต็มได้
+// ต้องตรงกับ STM32 node (repo 2025-12-30_STM32_LoRaMesh)
+#define VIA_ENTRY_MAX_LEN     14   // "|V:255,-128" + null
+#define MAX_PAYLOAD_LEN       200  // MAX_MESSAGE_LEN(251) - header(4) - CRC(2) เผื่อ margin
+
+// Adaptive radio: TX power + SF based on RSSI
+// กฎ กสทช. 920-925 MHz: ≤ 500 mW EIRP (~27 dBm) — module HW limit +22 dBm ปลอดภัย
+#define ADAPTIVE_POWER_MIN     7    // dBm — RSSI ≥ -75
+#define ADAPTIVE_POWER_MED     10   // dBm — RSSI -75 to -90
+#define ADAPTIVE_POWER_HIGH    14   // dBm — RSSI -90 to -105
+#define ADAPTIVE_POWER_MAX     17   // dBm — RSSI < -105
+
+#define ADAPTIVE_SF_GOOD       7    // RSSI ≥ -75
+#define ADAPTIVE_SF_FAIR       8    // RSSI -75 to -90
+#define ADAPTIVE_SF_WEAK       10   // RSSI -90 to -105
+#define ADAPTIVE_SF_POOR       12   // RSSI < -105
+
+bool adaptiveRadio = true;
+// [MEAS] ค่าคุณภาพลิงก์ที่ GetPacketStatus คืนมาแต่โค้ดเดิมทิ้งไป
+int16_t lastRxSnrQ4     = 0;   // quarter-dB (int8 ดิบจากชิป) → หาร 4 ได้ dB
+int16_t lastRxSignalRssi = 0;  // dBm หลัง despread (SX1262 เท่านั้น)
+#ifdef FW_MEAS_MODE
+static uint32_t g_measSeq = 0;
+#endif
+uint8_t currentTxPower = LORA_TX_POWER_DBM;
+uint8_t currentSF = 7;
+
+// ACK feedback + silence timeout for adaptive power (Phase 1: Gateway required)
+// ปัจจุบันยังไม่มี Gateway → ใช้ silence timeout อย่างเดียว
+uint32_t lastHeardTime = 0;    // ms — ครั้งสุดท้ายที่ได้ยิน packet ใด ๆ
+#define SILENCE_TIMEOUT_MS 300000  // 5 นาที เงียบ → ส่งแรงสุด
 
 // RSSI-based forwarding delay table (best relay sends first)
 #define RSSI_DELAY_GOOD       200    // ≥ -75 dBm
@@ -109,7 +144,7 @@ static const char* CRYPTO_KEY = "1234567890000000";
 #define RSSI_EMA_ALPHA_NUM    3     // EMA numerator   (α = 0.3)
 #define RSSI_EMA_ALPHA_DEN    10    // EMA denominator
 
-// ML mode toggle
+// ML mode toggle — default ON
 bool mlMode = true;
 uint8_t mlProbPct = 50;  // last ML probability in % (0-100)
 
@@ -322,13 +357,14 @@ void updateOLED() {
         snprintf(line, sizeof(line), "Node ID:%d LoRa:%s", THIS_NODE_ADDRESS,
                  lora_ok ? "OK" : "FAIL");
         display.println(line);
-        snprintf(line, sizeof(line), "Temp:%dC %s", temperature,
-                 bme_ok ? "" : "(SIM)");
-        display.println(line);
-        snprintf(line, sizeof(line), "Hum :%d%%", humidity);
+        snprintf(line, sizeof(line), "T:%dC H:%d%% %s", temperature,
+                 humidity, bme_ok ? "" : "(SIM)");
         display.println(line);
         snprintf(line, sizeof(line), "TX#:%d Pwr:%+ddBm", txSequenceNum,
-                 LORA_TX_POWER_DBM);
+                 currentTxPower);
+        display.println(line);
+        snprintf(line, sizeof(line), "Radio:%s SF:%d",
+                 adaptiveRadio ? "ADAPT" : "FIXED", currentSF);
         display.println(line);
         snprintf(line, sizeof(line), "Last TX:%s",
                  !ownTxAttempted ? "--" : (lastOwnTxOk ? "SENT" : "DROP"));
@@ -372,8 +408,9 @@ void updateOLED() {
                 }
             }
             display.println(line);
-            snprintf(line, sizeof(line), "TX:%+ddBm RX:%ddBm",
-                     LORA_TX_POWER_DBM, lastRxRssi);
+            snprintf(line, sizeof(line), "TX:%+ddBm SF:%d RX:%ddBm",
+                     currentTxPower,
+                     currentSF, lastRxRssi);
             display.println(line);
         }
     } else {
@@ -567,9 +604,13 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
                 uint16_t idx = (start + i) % RSSI_LOG_SIZE;
                 RssiSample* s = &rssiLog[idx];
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                "%lu,%u,%u,%u,%u,%d,%d,%u,%02X\n",
+                                "%lu,%u,%u,%u,%u,%d,%s%d.%02d,%u,%02X\n",
                                 s->timestamp, s->nodeId, s->srcNode, s->rhFrom,
-                                s->hopCount, s->rssi, s->snr, s->decision, s->flags);
+                                s->hopCount, s->rssi,
+                                (s->snr < 0 ? "-" : ""),
+                                (s->snr < 0 ? -s->snr : s->snr) / 4,
+                                ((s->snr < 0 ? -s->snr : s->snr) % 4) * 25,
+                                s->decision, s->flags);
             }
             pChar->setValue((uint8_t*)buf, pos);
             dbgf("BLE: sent %d bytes RSSI log", pos);
@@ -963,6 +1004,46 @@ static uint32_t rssiToDelayMs(int16_t rssi) {
     else                   return RSSI_DELAY_POOR;
 }
 
+// ============ ADAPTIVE RADIO: TX Power + SF ============
+// Map RSSI → TX power (dBm) — ปลอดภัยตาม กสทช. 920-925 MHz ≤ 500 mW EIRP
+static uint8_t rssiToTxPower(int16_t rssi) {
+    if      (rssi >= -75)  return ADAPTIVE_POWER_MIN;   // ใกล้ → ลดกำลัง
+    else if (rssi >= -90)  return ADAPTIVE_POWER_MED;   // ปานกลาง
+    else if (rssi >= -105) return ADAPTIVE_POWER_HIGH;  // ไกล → เพิ่มกำลัง
+    else                   return ADAPTIVE_POWER_MAX;   // ไกลมาก → กำลังสูงสุด
+}
+
+// Map RSSI → Spreading Factor (SF7–SF12)
+// SF สูง = ระยะไกลขึ้น แต่ data rate ต่ำลง, ToF นานขึ้น
+static uint8_t rssiToSF(int16_t rssi) {
+    if      (rssi >= -75)  return ADAPTIVE_SF_GOOD;
+    else if (rssi >= -90)  return ADAPTIVE_SF_FAIR;
+    else if (rssi >= -105) return ADAPTIVE_SF_WEAK;
+    else                   return ADAPTIVE_SF_POOR;
+}
+
+// Apply TX power to radio hardware (called before each TX)
+// SF คงที่ 7 เสมอ — ถ้าเปลี่ยน SF จะทำให้ RX ไม่ตรงกับ node อื่น
+static void applyRadioParams(uint8_t txPower) {
+#ifdef USE_SX1262
+    sx1262SetStandby();
+    delay(1);
+    // Set TX power only
+    uint8_t txParams[2] = {txPower, 0x04};  // dBm, ramp 200us
+    sx1262WriteCommand(0x8E, txParams, 2);
+#endif
+#ifdef USE_RFM95
+    rfm95WriteReg(RFM95_REG_OPMODE, RFM95_MODE_STANDBY);
+    delay(1);
+    // Set TX power: PA_BOOST, OutputPower = txPower - 2
+    uint8_t paVal = 0x80 | (txPower - 2);
+    if (txPower > 17) paVal = 0x80 | 15;  // clamp to max reg value
+    rfm95WriteReg(RFM95_REG_PA_CONFIG, paVal);
+#endif
+    currentTxPower = txPower;
+    currentSF = 7;  // SF คงที่ (SF10 สำหรับป่าไม้)
+}
+
 void addToMessageQueue(const uint8_t* packet, uint8_t len,
                        uint8_t srcNode, uint8_t seqNum, int16_t rssi) {
     for (int i = 0; i < MESSAGE_QUEUE_SIZE; i++) {
@@ -1149,6 +1230,9 @@ void handleSerialCommand() {
         dbgf("EMA threshold: %d dBm", rssiSourceClose);
         dbgf("ML mode: %s", mlMode ? "ON" : "OFF");
         dbgf("ML last prob: %d%%", mlProbPct);
+        dbgf("Adaptive radio: %s", adaptiveRadio ? "ON" : "OFF");
+        dbgf("TX power: %d dBm, SF: %d", currentTxPower, currentSF);
+        dbgf("Silence: %lus", (millis() - lastHeardTime) / 1000UL);
     } else if (cmd == "MLTOGGLE") {
         mlMode = !mlMode;
         dbgf("ML mode: %s", mlMode ? "ON" : "OFF");
@@ -1158,10 +1242,41 @@ void handleSerialCommand() {
     } else if (cmd == "MLOFF") {
         mlMode = false;
         dbg("ML mode: OFF");
+    } else if (cmd == "ADAPTIVE") {
+        adaptiveRadio = !adaptiveRadio;
+        dbgf("Adaptive radio: %s", adaptiveRadio ? "ON" : "OFF");
+    } else if (cmd == "ADAPTON") {
+        adaptiveRadio = true;
+        dbg("Adaptive radio: ON");
+    } else if (cmd == "ADAPTOFF") {
+        adaptiveRadio = false;
+        dbg("Adaptive radio: OFF");
     }
 }
 
 void sendRawPacket(const uint8_t* packet, uint8_t len) {
+#ifdef FW_MEAS_MODE
+    {   uint32_t mseq = (len >= 9 && packet[4] == 'M')
+            ? ((uint32_t)packet[5] << 24 | (uint32_t)packet[6] << 16 |
+               (uint32_t)packet[7] << 8  | (uint32_t)packet[8]) : 0;
+        meas_log_tx(packet[0], mseq, (len >= 5 ? (char)packet[4] : '?'),
+                    (uint8_t)(packet[3] & 0x0F), len, true);
+    }
+#endif
+    // Apply adaptive radio params before relay TX
+    // Relay ไม่มี ACK feedback → ใช้ silence timeout + RSSI
+    // [MEAS] โหมดวัดตรึงกำลังส่ง — adaptive power (7→17 dBm ตาม RSSI) ทำให้
+    // RSSI-vs-distance กลายเป็นลูปป้อนกลับ ไม่ใช่ path loss ล้วน
+    if (adaptiveRadio && !MEAS_FREEZE_POWER) {
+        uint8_t pwr;
+        if (millis() - lastHeardTime > SILENCE_TIMEOUT_MS) {
+            pwr = ADAPTIVE_POWER_MAX;
+        } else {
+            int16_t refRssi = (lastRxValid && lastRxRssi < 0) ? lastRxRssi : rssiSourceClose;
+            pwr = rssiToTxPower(refRssi);
+        }
+        applyRadioParams(pwr);
+    }
 #ifdef USE_SX1262
     sx1262SetStandby();
     delay(2);
@@ -1235,7 +1350,7 @@ bool configureLoRaModem() {
     sx1262WriteCommand(0x95, paConfig, 4);
     uint8_t txParams[2] = {12, 0x04};  // 12 dBm, ramp 200us
     sx1262WriteCommand(0x8E, txParams, 2);
-    uint8_t modParams[4] = {0x07, 0x04, 0x01, 0x00};  // SF7, BW125, CR4/5
+    uint8_t modParams[4] = {0x07, 0x04, 0x01, 0x00};  // SF7, BW125, CR4/5 (SF10=0xA0 สำหรับป่าไม้)
     sx1262WriteCommand(0x8B, modParams, 4);
     uint8_t pktParams[6] = {0x00, 0x08, 0x00, 0xFF, 0x01, 0x00};
     sx1262WriteCommand(0x8C, pktParams, 6);
@@ -1265,7 +1380,7 @@ bool configureLoRaModem() {
     rfm95WriteReg(RFM95_REG_LNA, 0x23);  // LNA max gain
     // Modem config: BW=125kHz(0x70), CR=4/5(0x02), explicit header(0x00)
     rfm95WriteReg(RFM95_REG_MODEM_CFG1, 0x72);
-    // SF=7(0x70), CRC on(0x04)
+    // SF=7(0x70), CRC on(0x04) — SF10(0xA0) สำหรับป่าไม้
     rfm95WriteReg(RFM95_REG_MODEM_CFG2, 0x74);
     // LDRO off, AGC auto
     rfm95WriteReg(RFM95_REG_MODEM_CFG3, 0x04);
@@ -1384,6 +1499,61 @@ bool initLoRa() {
 }
 
 // ============ LORA TX (RadioHead compatible) ============
+#ifdef FW_MEAS_MODE
+// ================= [MEAS] hook สำหรับ meas.h =================
+// เฟรมวัด: [TO=0xFF][FROM=node][ID][FLAGS=0]['M'][seq be32][pad...] ยาวคงที่ตาม PL
+// receiver อ่าน seq จาก byte 5..8 เมื่อ byte 4 == 'M'
+bool meas_hw_send(uint8_t frame_len){
+    if(frame_len < 9)   frame_len = 9;
+    if(frame_len > MAX_MESSAGE_LEN) frame_len = MAX_MESSAGE_LEN;
+    uint8_t pkt[MAX_MESSAGE_LEN];
+    uint32_t seq = ++g_measSeq;
+    pkt[0]=0xFF; pkt[1]=THIS_NODE_ADDRESS; pkt[2]=(uint8_t)(seq & 0xFF); pkt[3]=0x00;
+    pkt[4]='M';
+    pkt[5]=(uint8_t)(seq>>24); pkt[6]=(uint8_t)(seq>>16);
+    pkt[7]=(uint8_t)(seq>>8);  pkt[8]=(uint8_t)seq;
+    for(uint8_t i=9;i<frame_len;i++) pkt[i]=(uint8_t)i;   // padding ที่ทำนายได้
+    sendRawPacket(pkt, frame_len);                        // log TX เกิดใน sendRawPacket
+    return true;
+}
+
+bool meas_hw_set_power(int8_t dbm){
+    if(dbm < -9 || dbm > 22) return false;
+    applyRadioParams((uint8_t)dbm);
+    return true;
+}
+
+// SF ปรับ runtime — SetModulationParams (0x8B) พร้อม LowDataRateOptimize
+// ⚠️ LDRO ต้องเปิดที่ SF11/12 บน BW125 ไม่งั้นฝั่งรับ decode ไม่ได้ (บั๊กเงียบ)
+bool meas_hw_set_sf(uint8_t sf){
+    if(sf < 5 || sf > 12) return false;
+#ifdef USE_SX1262
+    sx1262SetStandby();
+    delay(1);
+    uint8_t ldro = (sf >= 11) ? 1 : 0;
+    uint8_t mp[4] = { sf, 0x04, 0x01, ldro };   // BW 125 kHz, CR 4/5
+    sx1262WriteCommand(0x8B, mp, 4);
+    currentSF = sf;
+    setModeRx();
+    return true;
+#else
+    return false;   // RFM95: ยังไม่รองรับเปลี่ยน SF ตอน runtime
+#endif
+}
+
+int meas_hw_rssi_inst(){
+#ifdef USE_SX1262
+    setModeRx();
+    delay(5);
+    uint8_t r = 0;
+    sx1262ReadCommand(0x15, &r, 1);      // GetRssiInst
+    return -(int)(r / 2);
+#else
+    return (int)rfm95ReadReg(0x1B) / -2;  // RegRssiValue (โดยประมาณ)
+#endif
+}
+#endif  // FW_MEAS_MODE
+
 void sendPacket() {
     if (!lora_ok) return;
 
@@ -1419,6 +1589,24 @@ void sendPacket() {
     packet[2] = rhMsgId++;
     packet[3] = FLAG_ACK_REQ;  // hop=0, ack_req=1 (origin)
     memcpy(&packet[4], encrypted, encLen);
+
+    // Apply adaptive radio params before TX
+    // ใช้ silence timeout + RSSI-based power
+    // (ACK feedback จะใส่เมื่อมี Gateway — Phase 1)
+    // [MEAS] โหมดวัดตรึงกำลังส่ง — adaptive power (7→17 dBm ตาม RSSI) ทำให้
+    // RSSI-vs-distance กลายเป็นลูปป้อนกลับ ไม่ใช่ path loss ล้วน
+    if (adaptiveRadio && !MEAS_FREEZE_POWER) {
+        uint8_t pwr;
+        if (millis() - lastHeardTime > SILENCE_TIMEOUT_MS) {
+            // เงียบเกิน 5 นาที → อาจไม่มีใครได้ยินเรา → ส่งแรงสุด
+            pwr = ADAPTIVE_POWER_MAX;
+            dbg("ADAPT: silence → max");
+        } else {
+            int16_t refRssi = (lastRxValid && lastRxRssi < 0) ? lastRxRssi : rssiSourceClose;
+            pwr = rssiToTxPower(refRssi);
+        }
+        applyRadioParams(pwr);
+    }
 
     // Standby → Buffer → TX
     bool sent = false;
@@ -1497,6 +1685,19 @@ void receivePacket() {
     uint8_t pktStatus[3];
     sx1262ReadCommand(0x14, pktStatus, 3);
     rssi = -(int16_t)pktStatus[0] / 2;
+    // [MEAS] ไบต์ที่ 2 และ 3 อ่านมาอยู่แล้วแต่โค้ดเดิมทิ้ง — SnrPkt (quarter-dB) และ SignalRssiPkt
+    lastRxSnrQ4      = (int16_t)(int8_t)pktStatus[1];
+    lastRxSignalRssi = -(int16_t)pktStatus[2] / 2;
+#ifdef FW_MEAS_MODE
+    {   // log ทุกเฟรมที่วิทยุรับได้ รวมที่ CRC เสีย — เฟรมพังคือข้อมูลขอบ coverage
+        uint32_t mseq = (rxLen >= 9 && packet[4] == 'M')
+            ? ((uint32_t)packet[5] << 24 | (uint32_t)packet[6] << 16 |
+               (uint32_t)packet[7] << 8  | (uint32_t)packet[8]) : 0;
+        meas_log_rx(packet[1], mseq, (rxLen >= 5 ? (char)packet[4] : '?'),
+                    (uint8_t)(packet[3] & 0x0F), (uint8_t)rxLen,
+                    !sx1262CrcFail, rssi, lastRxSnrQ4, lastRxSignalRssi);
+    }
+#endif
     if (sx1262CrcFail) {
         // Log CRC-failed packet with RSSI only
         logRssiSample(0, 0, 0, rssi, 0, RELAY_STATUS_DROP_CRC, RSSI_LOG_FLAG_CRC_FAIL);
@@ -1521,6 +1722,18 @@ void receivePacket() {
     rfm95WriteReg(RFM95_REG_FIFO_ADDR_PTR, rfm95ReadReg(RFM95_REG_FIFO_RX_CURR));
     rfm95ReadBurst(RFM95_REG_FIFO, packet, rxLen);
     rssi = (int16_t)rfm95ReadReg(RFM95_REG_PKT_RSSI) - 157;
+    // [MEAS] RegPktSnrValue เป็น int8 หน่วย quarter-dB เหมือน SX1262
+    lastRxSnrQ4      = (int16_t)(int8_t)rfm95ReadReg(RFM95_REG_PKT_SNR);
+    lastRxSignalRssi = rssi;   // RFM95 ไม่มี signal-RSSI แยก
+#ifdef FW_MEAS_MODE
+    {   uint32_t mseq = (rxLen >= 9 && packet[4] == 'M')
+            ? ((uint32_t)packet[5] << 24 | (uint32_t)packet[6] << 16 |
+               (uint32_t)packet[7] << 8  | (uint32_t)packet[8]) : 0;
+        meas_log_rx(packet[1], mseq, (rxLen >= 5 ? (char)packet[4] : '?'),
+                    (uint8_t)(packet[3] & 0x0F), (uint8_t)rxLen,
+                    !rfm95CrcFail, rssi, lastRxSnrQ4, lastRxSignalRssi);
+    }
+#endif
     if (rfm95CrcFail) {
         // Log CRC-failed packet with RSSI only
         logRssiSample(0, 0, 0, rssi, 0, RELAY_STATUS_DROP_CRC, RSSI_LOG_FLAG_CRC_FAIL);
@@ -1611,6 +1824,9 @@ void receivePacket() {
         else rxBat = msg.substring(bPos + 2).toInt();
     }
 
+    // STM32 node ใส่ SIM:1 เมื่อ BME280 ไม่ตอบ (ค่าจำลอง ไม่ใช่ค่าวัดจริง)
+    bool isSim = (msg.indexOf("SIM:1") != -1);
+
     // Parse GPS if present
     double rxLat = 0.0, rxLon = 0.0;
     int laPos = msg.indexOf("LA:");
@@ -1639,6 +1855,7 @@ void receivePacket() {
     lastRxTemp = rxTemp;
     lastRxHum = rxHum;
     lastRxBat = rxBat;
+    lastHeardTime = millis();  // อัปเดต silence timeout
 
     dbgf("RX N:%d S:%d R:%d H:%d", srcNode, seqNum, rssi, hopCount);
     dbgf(" T:%d H:%d%% B:%dmV", rxTemp, rxHum, rxBat);
@@ -1659,8 +1876,9 @@ void receivePacket() {
     Serial.print(hopCount);
     Serial.print(F(" rssi:"));
     Serial.print(rssi);
+    if (isSim) Serial.print(F(" SIM"));
     Serial.print(F("] "));
-    Serial.println(decrypted);
+    Serial.println(decrypted);   // รวม VIA chain "|V:<relay>,<rssi>" ถ้ามี
 
     // ---- Parse ACK payload for relay/cancel ----
     // ACK format: "ACK:<src>|S:<seq>|GW:<gw_id>"
@@ -1780,15 +1998,45 @@ void receivePacket() {
                 }
 
                 if (shouldRelay) {
-                    uint8_t relayPkt[rxLen];
-                    memcpy(relayPkt, packet, rxLen);
+                    // ต่อ VIA trace: node ที่ทวน + RSSI ที่ได้ยิน hop ก่อนหน้า
+                    // gateway ถอดเส้นทางเต็มได้ เช่น 102 -(-105)- 116 -(-98)- 104 - GW
+                    // ต้อง re-encrypt เพราะ payload เปลี่ยน (XOR + CRC16 ใหม่)
+                    char fwdPayload[MAX_PAYLOAD_LEN + 1];
+                    char viaBuf[VIA_ENTRY_MAX_LEN];
+                    snprintf(viaBuf, sizeof(viaBuf), "|V:%d,%d",
+                             THIS_NODE_ADDRESS, (int)rssi);
+
+                    int baseLen = strlen(decrypted);
+                    int viaLen  = strlen(viaBuf);
+                    if (baseLen + viaLen <= MAX_PAYLOAD_LEN) {
+                        memcpy(fwdPayload, decrypted, baseLen);
+                        memcpy(fwdPayload + baseLen, viaBuf, viaLen);
+                        fwdPayload[baseLen + viaLen] = '\0';
+                    } else {
+                        // payload เต็ม - ส่งต่อโดยไม่ต่อ trace ดีกว่าทิ้งข้อมูล
+                        int copyLen = (baseLen > MAX_PAYLOAD_LEN) ? MAX_PAYLOAD_LEN : baseLen;
+                        memcpy(fwdPayload, decrypted, copyLen);
+                        fwdPayload[copyLen] = '\0';
+                        dbg("FWD: payload full, VIA omitted");
+                    }
+
+                    uint8_t fwdPayloadLen = strlen(fwdPayload);
+                    uint8_t fwdEncLen = fwdPayloadLen + 2;
+                    uint8_t relayPkt[4 + fwdEncLen];
+
+                    xorEncrypt(fwdPayload, fwdPayloadLen, &relayPkt[4]);
+                    uint16_t fwdCRC = calculateCRC16(&relayPkt[4], fwdPayloadLen);
+                    relayPkt[4 + fwdPayloadLen]     = (fwdCRC >> 8) & 0xFF;
+                    relayPkt[4 + fwdPayloadLen + 1] = fwdCRC & 0xFF;
+
                     relayPkt[0] = BROADCAST_ADDRESS;
                     relayPkt[1] = THIS_NODE_ADDRESS;
                     relayPkt[2] = rhMsgId++;
                     // Preserve FLAGS bits 4-5 (IS_ACK, ACK_REQ) while incrementing hop
                     relayPkt[3] = ((hopCount + 1) & FLAG_HOP_MASK) |
                                   (rhFlags & ~FLAG_HOP_MASK);
-                    addToMessageQueue(relayPkt, rxLen, dupSrc, dupSeq, rssi);
+
+                    addToMessageQueue(relayPkt, 4 + fwdEncLen, dupSrc, dupSeq, rssi);
                     dbgf("FWD N:%d S:%d H:%d>%d R:%d%s",
                          dupSrc, dupSeq, hopCount, hopCount + 1, rssi,
                          isAck ? " ACK" : "");
@@ -1930,6 +2178,14 @@ void setup() {
     dbg("Ready.");
     updateOLED();
 
+#ifdef FW_MEAS_MODE
+    // [MEAS] ปิด adaptive power ทันทีที่บูต — ต้องตรึงกำลังส่งตลอดการวัด
+    adaptiveRadio = false;
+    applyRadioParams(MEAS_TX_DEF);
+    meas_set_self(THIS_NODE_ADDRESS);
+    Serial.println(F("# MEASUREMENT BUILD: adaptive power OFF, TX frozen. type HELP"));
+#endif
+
     digitalWrite(STATUS_LED, HIGH);
     delay(1000);
 }
@@ -1942,6 +2198,7 @@ void loop() {
 
     handleUIButton();
     handleSerialCommand();
+    meas_cmd_poll();          // [MEAS] คำสั่งวัด + เดินตาราง SF (ว่างเปล่าเมื่อไม่ใช่ build วัด)
 
     // RX has priority
     receivePacket();

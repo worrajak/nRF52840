@@ -3,6 +3,9 @@ source: platformio.ini
 fetched: 2026-07-30
 topic: platformio, build-config, node-id, radio-select, apple-silicon
 used_in: "[[_project-brief]]"
+r1_block: [1]
+r1_state: doing
+r1_role: evidence
 ---
 
 # PlatformIO Build Configuration

@@ -1,52 +1,44 @@
 ---
-id: 20260726005
-tags: [nrf52840, rfm95, sx1276, node-116, build, uf2, low-power]
+id: 20260730007
+tags: [nrf52840, sx1262, node-119, build, uf2, adaptive-radio, ml]
 ---
 
-# Node 116 / RFM95 — Build ปัจจุบัน
+# Node 119 / SX1262 — Build ปัจจุบัน (2026-07-30)
 
 ## Config ที่ใช้อยู่จริงใน `platformio.ini`
 
 ```ini
-custom_node_id  = 116
-custom_radio    = USE_RFM95
+custom_node_id  = 119
+custom_radio    = USE_SX1262
 custom_low_power = 1
 ```
 
-เป็นการสลับจากชุด Node 119 / SX1262 ที่บันทึกไว้ใน
-[[SX1262_Low_Power_RX_Always_On]] มาทดสอบบอร์ดที่ติดโมดูล RFM95/SX1276
+เปลี่ยนจาก Node 116 / RFM95 มาเป็น Node 119 / SX1262 สำหรับ field test
+
+## Features ที่เพิ่มใน build นี้
+
+| Feature | รายละเอียด |
+|---------|-----------|
+| ML mode default ON | `mlMode = true` — ใช้ neural network ตัดสิน relay |
+| Adaptive TX power | 7/10/14/17 dBm ตาม RSSI, **SF10 fixed** (ป่าไม้) |
+| OLED layout ใหม่ | T/H รวมบรรทัด, Radio:ADAPT แทนที่ Hum |
 
 ## UF2 ที่มีอยู่
 
-| ไฟล์ | ขนาด | blocks | เวลา build |
-|---|---|---|---|
-| `firmware_node_116_rfm95.uf2` | 366,080 | 715 | 2026-07-26 13:20 |
-| `firmware_node_116_sx1262_ra01sh.uf2` | 367,104 | 717 | 2026-07-26 12:04 |
-| `firmware_node_119_sx1262_ra01sh.uf2` | 367,104 | 717 | 2026-07-26 12:06 |
+| ไฟล์ | ขนาด | blocks |
+|------|-------|--------|
+| `firmware_node_119_sx1262_ra01sh.uf2` | ~367 KB | ~717 |
 
-`firmware.uf2` และ `firmware_node_116.uf2` ที่ project root คือสำเนาของ build
-ล่าสุด (RFM95) ทั้งคู่ ตอนหยิบไฟล์ไปลงบอร์ดควรใช้ชื่อเต็มที่ระบุ radio เสมอ
-เพราะชื่อสั้นถูกเขียนทับทุกครั้งที่ `pio run`
+## ข้อควรระวัง
 
-ทุกไฟล์หารด้วย 512 ลงตัว จึงเป็น UF2 จริงตาม [[UF2_Post_Build_nRF52840]]
+- ถ้าสลับ radio ต้อง build ใหม่ — firmware รองรับ radio เดียว
+- Adaptive radio ปรับเฉพาะ TX power, SF คงที่ 7 (ไม่งั้น RX ไม่ตรง)
+- ML mode default ON — ถ้าต้องการ rule-based ส่ง `MLOFF` ทาง Serial
 
-## ข้อควรระวังเมื่อสลับ radio
-
-Firmware หนึ่งไฟล์รองรับ radio เดียว ถ้าเอา UF2 ของ SX1262 ไปลงบอร์ด RFM95
-(หรือกลับกัน) จะเห็นอาการ Radio FAIL พร้อมค่า Version แปลก ๆ เช่น `A2` / `C2`
-ซึ่งไม่ใช่ฮาร์ดแวร์เสีย ให้ตรวจว่าชิปบนบอร์ดตรงกับ `custom_radio` แล้ว build ใหม่
-
-| ชิปบนบอร์ด | ต้องใช้ |
-|---|---|
-| RFM95 / SX1276 (DIO0, ไม่มี BUSY) | `USE_RFM95` |
-| RA-01SH / HT-RA62 (SX1262, DIO1 + BUSY) | `USE_SX1262` |
-
-## สถานะการทดสอบ
-
-- build ผ่าน และได้ UF2 ครบทั้งสาม path
-- ยังไม่มีบันทึกผลบนบอร์ดจริงของชุด 116/RFM95 (LoRa `OK`/`FAIL`, RSSI, ระยะ)
-- `custom_low_power = 1` เหมือนเดิม คือ System-ON idle โดย RX และ OLED ยังเปิด
-  จึงคาดว่าพฤติกรรมด้านพลังงานเทียบเท่าชุด 119 ต่างกันแค่ตัวโมดูลวิทยุ
+## Links
+- [[Adaptive_Radio_TX_Power]] — adaptive TX power
+- [[TFLite_Integration]] — ML inference
+- [[_project-brief]]
 
 ## Links
 

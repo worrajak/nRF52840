@@ -6,6 +6,12 @@ tags: [lora, ml, tflite, inference, neural-network, nrf52840]
 # TFLite Integration — ML Inference บน nRF52840
 
 > **สถานะ:** ✅ Implemented ใน `include/rssi_classifier.h` + `src/main.cpp` 2026-07-29
+> **แก้ 2026-07-30 — ML default OFF + pipeline retrain ใช้งานได้จริง** (เจอตอน port ไป FireWild_DePIN)
+> พบ 3 อย่างที่ทำให้ ML mode ใช้จริงไม่ได้:
+> 1. **น้ำหนักชุดแรกไม่แยกอะไรเลย** — replay บน host ได้ prob 0.506–0.678 **ทุก input (≥0.5 = relay หมด)** และทิศกลับด้าน (rssi −47 ใกล้ → 0.506 · −110 ไกล → 0.647) → ตอน `mlMode=true` แปลว่า **adaptive threshold ไม่มีโอกาสทำงานเลย** ในบิลด์ default → เปลี่ยนเป็น `mlMode = false` (rule เป็นตัวจริง · เปิด ML ด้วย `MLON` หลังตรวจตัวเลข)
+> 2. **`node` feature std=1e-8** → `normalizeInput` หารด้วย floor 1e-6 → เปลี่ยน `custom_node_id` เป็น 116/119 (บรรทัดเดียวใน .ini) ทำให้ป้อน (116−117)/1e-6 = **−1,000,000** เข้า layer 1 → ReLU อิ่มตัว inference มั่ว → แก้: std<1e-6 ⇒ `norm=0` (feature ไม่มี variance = ไม่มีข้อมูล)
+> 3. **retrain ไม่มีผลกับ firmware** — `train_model.py` เขียน TFLite byte array ลง `rssi_classifier.h` ที่ CWD ซึ่งไม่มีโค้ดไหนอ้างถึง (firmware คอมไพล์ `include/`) → แก้: เขียน `include/rssi_classifier.h` ตรง ๆ (path อิงรีโป ไม่อิง CWD) + atomic write
+> retrain ด้วย `rssi_log.csv` เดิมหลังแก้ → **acc 97.6% · prob 0.000–0.996 · strong 0.000 / weak 0.728 (ทิศถูก)** · ไม่ต้องมี TensorFlow/sklearn แล้ว (numpy พอ)
 
 ## ภาพรวม
 
@@ -33,37 +39,44 @@ Output: probability (0.0–1.0)
 
 ## Normalization Constants
 
+ชุดปัจจุบัน (regen 2026-07-30 จาก `rssi_log.csv` 42 origin rows) — ค่าอยู่ในหัวไฟล์ที่ generate:
+
 | Feature | Mean | Std |
 |---------|------|-----|
-| rssi | -59.068 | 21.694 |
-| src | 104.727 | 23.077 |
-| from | 104.727 | 23.077 |
-| node | 117.0 | 1e-8 (constant) |
+| rssi | -57.000 | 19.973 |
+| src | 109.714 | 3.283 |
+| from | 109.714 | 3.283 |
+| node | 117.0 | **0.0 → ถูก zero ทิ้ง** (คงที่ตอน log = ไม่มีข้อมูล) |
+
+> ⚠️ ห้ามใส่ std เล็ก ๆ (1e-8) ให้ feature ที่คงที่ — ให้ใส่ 0 แล้ว firmware จะบังคับ `norm=0`
+> `src`/`from` = node id → โมเดลเรียน "ใครส่ง" ไม่ใช่ "สัญญาณแรงแค่ไหน" · dataset ใหญ่ขึ้นควรพิจารณาตัดออก เหลือฟีเจอร์เชิงสัญญาณ
 
 ## Training Pipeline
 
 ```
-rssi_log.csv (86 samples, 4 nodes: 108, 116, 117, 118)
-  → tools/train_model.py
-    → Decision Tree (if-else chain, for reference)
-    → TFLite model (rssi_classifier.h, 2388 bytes)
-      → Manually extract weights → include/rssi_classifier.h
+rssi_log.csv  (เก็บด้วย tools/rssi_logger.py — ต้องมี ≥10 origin rows)
+  → python3 tools/train_model.py rssi_log.csv     (numpy เท่านั้น · ไม่ต้อง TF/sklearn)
+    → เทรน MLP 4→8→4→1 (Adam + class weight) แล้ว "ตรวจก่อนปล่อย":
+        · prob ต้องคร่อม 0.5 ทั้งสองฝั่ง (ไม่ใช่ตัดสินทางเดียว)
+        · สัญญาณแรงต้อง relay น้อยกว่าสัญญาณอ่อน (ทิศไม่กลับ)
+      ไม่ผ่าน → exit 3 ไม่เขียนไฟล์ (กันน้ำหนักเสียหลุดขึ้นบอร์ดซ้ำรอบเดิม)
+    → เขียน include/rssi_classifier.h (atomic) → pio run
 ```
 
 ## ไฟล์สำคัญ
 
 | ไฟล์ | คำอธิบาย |
 |------|---------|
-| `include/rssi_classifier.h` | Weights + inference engine (lightweight C) |
-| `tools/train_model.py` | Python training pipeline |
-| `rssi_log.csv` | 86 samples from field test |
-| `rssi_classifier.h` (root) | TFLite model binary (2388 bytes) |
+| `include/rssi_classifier.h` | ⭐ **ตัวที่ firmware คอมไพล์** — weights + forward pass (generated) |
+| `tools/train_model.py` | training pipeline (numpy) — เขียน `include/` ให้เลย |
+| `rssi_log.csv` | 86 samples from field test (42 origin rows ใช้เทรน) |
+| `rssi_classifier.h` (root) | ⚠️ **stale ไม่ถูกคอมไพล์** — ของเก่าจาก pipeline ที่พัง · ลบได้ (สำเนาอยู่ `3_Resources/Refs/`) |
 
 ## Serial Commands
 
 | Command | การทำงาน |
 |---------|---------|
-| `MLON` | เปิด ML mode (default) |
+| `MLON` | เปิด ML mode (**ไม่ใช่ default แล้ว** — default = rule) |
 | `MLOFF` | กลับไปใช้ rule-based (adaptive threshold) |
 | `MLTOGGLE` | สลับโหมด |
 | `STATS` | ดูสถานะ + threshold + ML probability |

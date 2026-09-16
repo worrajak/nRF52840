@@ -6,7 +6,7 @@ tags: [nrf52840, sx1262, low-power, lora, oled, rx]
 # SX1262 Low Power — RX และ OLED เปิดตลอด
 
 > บันทึกของชุด **Node 119 / SX1262** ที่ยืนยันบนบอร์ดแล้ว
-> config ปัจจุบันใน `platformio.ini` สลับไปเป็น Node 116 / RFM95 แล้ว —
+> config ปัจจุบันใน `platformio.ini` กลับมาเป็น Node 119 / SX1262 แล้ว —
 > ดู [[Node116_RFM95_Build]]
 
 ## สถานะที่ยืนยันแล้ว (ชุด 119)

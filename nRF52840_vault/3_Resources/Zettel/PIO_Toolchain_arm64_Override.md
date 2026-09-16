@@ -1,6 +1,9 @@
 ---
 id: 20260721001
 tags: [platformio, toolchain, apple-silicon, n-able, build, rosetta]
+r1_block: [1]
+r1_state: doing
+r1_role: evidence
 ---
 
 # PlatformIO n-able Toolchain — x86 → arm64 บน Apple Silicon
