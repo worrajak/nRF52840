@@ -1,6 +1,9 @@
 ---
 id: 20260729004
 tags: [lora, rssi, logging, ml, training, data-collection]
+r1_block: [4]
+r1_state: doing
+r1_role: evidence
 ---
 
 # RSSI Data Logging — เก็บข้อมูล RSSI สำหรับ Train ML Model

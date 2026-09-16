@@ -105,3 +105,4 @@ cancelFromQueue(srcNode, seqNum);
 - Source: [[Roadmap_LoRa_Mesh]]
 - ใช้ใน: [[Architecture_LoRa_Mesh]], [[_project-brief]]
 - Related: [[Multi_GW_ACK_Dedup]]
+- [[Adaptive_Radio_TX_Power]] — adaptive TX power (แนวคิดเดียวกัน)

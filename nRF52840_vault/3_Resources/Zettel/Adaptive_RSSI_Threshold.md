@@ -1,6 +1,9 @@
 ---
 id: 20260729002
 tags: [lora, relay, rssi, adaptive, ema, ml]
+r1_block: [1]
+r1_state: blocked
+r1_role: confound
 ---
 
 # Adaptive RSSI Threshold (EMA) — ปรับ threshold อัตโนมัติตามสภาพแวดล้อม

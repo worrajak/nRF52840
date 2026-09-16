@@ -3,6 +3,9 @@ source: rssi_log.csv
 fetched: 2026-07-30
 topic: dataset, rssi-log, ml-training-data, field-test
 used_in: "[[TFLite_Integration]]"
+r1_block: [2]
+r1_state: blocked
+r1_role: confound
 ---
 
 # RSSI Log Dataset

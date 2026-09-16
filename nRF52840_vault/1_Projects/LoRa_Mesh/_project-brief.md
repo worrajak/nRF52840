@@ -56,6 +56,8 @@ STM32 Sensor (0x20–0x7F)
 - [x] **ML training pipeline** — tools/train_model.py, Decision Tree + TFLite
 - [x] **TFLite integration** — lightweight C inference (3-layer NN), no TFLite Micro runtime
 - [x] **ML mode toggle** — Serial: MLON/MLOFF/MLTOGGLE, OLED แสดง ML probability
+- [x] **Adaptive TX power** — RSSI-based: 7/10/14/17 dBm, SF คงที่ 7
+- [x] **OLED layout** — T/H รวมบรรทัด, Radio:ADAPT แทนที่ Hum
 
 ### Phase 5 — Tune & Harden
 - [ ] ทดสอบ 2–3 hops จริง
@@ -88,6 +90,7 @@ STM32 Sensor (0x20–0x7F)
 | RSSI data logging | ✅ 512 samples, CRC fail flag ([[RSSI_Data_Logging]]) |
 | ML inference | ✅ 3-layer NN (4→8→4→1), lightweight C, no TFLite runtime ([[TFLite_Integration]]) |
 | ML toggle | ✅ Serial MLON/MLOFF/MLTOGGLE, OLED แสดง ML probability |
+| Adaptive TX power | ✅ RSSI-based 7/10/14/17 dBm + ACK feedback + silence timeout ([[Adaptive_Radio_TX_Power]]) |
 
 ---
 

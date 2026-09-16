@@ -32,6 +32,7 @@
 | [[BLE_GPS_Sender]] | Web app: phone GPS → nRF52840 via BLE | ⭐ |
 | [[UF2_Post_Build]] | Post-build script: Intel HEX → UF2 | ⭐ |
 | [[RSSI_Log_Dataset]] | 86 samples field data for ML training | ⭐⭐⭐ |
+| [[Mesh-Protocol-Interop]] | 🔴 ทำ nRF52840 คุยกับ STM32 ได้ — hop ใน header, VIA trace, SIM flag | ⭐⭐⭐ |
 
 ---
 
@@ -45,6 +46,7 @@
 | [[Path_Success_Rate_Bayesian]] | Bayesian probability วัดโอกาส packet ถึง Gateway |
 | [[RSSI_Data_Logging]] | เก็บ RSSI log 512 samples → ดึงผ่าน Serial → train ML |
 | [[TFLite_Integration]] | ML inference บน nRF52840 — 3-layer NN แทน rule-based |
+| [[Adaptive_Radio_TX_Power]] | ปรับ TX power ตาม RSSI — 7/10/14/17 dBm, SF7 fixed |
 | [[Multi_GW_ACK_Dedup]] | หลาย GW ไม่ชนกัน: GW_ID × 200ms + Node-RED dedup |
 | [[Software_SPI_Bitbang_nRF52840]] | Workaround สำหรับ n-able PINS_COUNT=34 bug |
 | [[PIO_Toolchain_arm64_Override]] | 🍎 Apple Silicon: n-able toolchain x86 → override arm64 (ไม่ต้อง Rosetta) — build ผ่าน |
@@ -52,7 +54,8 @@
 | [[UF2_Post_Build_nRF52840]] | สร้าง UF2 จริงอัตโนมัติหลัง PlatformIO build |
 | [[PIO_Node_ID_Radio_Config]] | ตั้ง Node ID และเลือก SX1262/RA-01SH หรือ RFM95 จาก platformio.ini |
 | [[SX1262_Low_Power_RX_Always_On]] | Node 119: System-ON idle โดย SX1262 RX และ OLED เปิดตลอด ส่งทุก 5 นาที |
-| [[Node116_RFM95_Build]] | 🔧 Build ปัจจุบัน: Node 116 + RFM95 + low-power · ตาราง UF2 · กับดักสลับ radio ผิดรุ่น |
+| [[Node116_RFM95_Build]] | 🔧 Build ปัจจุบัน: Node 119 / SX1262 + adaptive radio + ML ON |
+| [[VIA_Trace_Reencrypt]] | VIA trace แลก CPU+airtime 71% กับการเห็นเส้นทางเต็ม + RSSI รายทอด |
 
 ---
 
@@ -106,6 +109,7 @@
 แนวคิดหลัก: [[RSSI_Forwarding_Delay]]   ← relay mechanism
             [[IS_ACK_Relay_Cancel_On_Heard]] ← ACK relay + cancel
             [[TFLite_Integration]]       ← ML inference (Phase 4)
+            [[Adaptive_Radio_TX_Power]]   ← adaptive TX power
             [[Multi_GW_ACK_Dedup]]       ← multi-gateway strategy
 ```
 
@@ -120,3 +124,20 @@
 | 3 | STM32 Sensor Node | ⬜ |
 | 4 | nRF52840 Relay (RSSI-based delay + cancel-on-heard + IS_ACK relay) | ✅ **Implemented 2026-07-29** |
 | 5 | Tune & Harden | ⬜ |
+
+
+---
+
+## 🔗 Vault พี่น้อง (เปิดแยกใน Obsidian)
+
+| Vault | ขอบเขต | ตำแหน่ง |
+|-------|--------|---------|
+| STM32_LoRaMesh_vault | firmware node STM32F103 + RFM95 | `../../2025-12-30_STM32_LoRaMesh/STM32_LoRaMesh_vault/` |
+| FireWildPMUC_vault | โครงการจริง DaaS Wildfire สัญญา บพข. C05F690131 — ผลจำลองโหลด, จำนวน gateway ที่ต้องใช้, roadmap, open questions | `~/Dropbox/2015-09-08_CESru/2026-04-21_FireWildPMUC/FireWildPMUC_vault/` |
+
+สัญญาโปรโตคอลร่วม: `../MESH_PROTOCOL.md` (สำเนาเหมือนกันใน repo STM32 — แก้ฝั่งใดต้องแก้อีกฝั่ง)
+Simulator โหลดเครือข่าย: `../../2025-12-30_STM32_LoRaMesh/sim/lora_mesh_sim.py`
+
+## R1 (ก้อน 1–2 — เฟิร์มแวร์/คาลิเบรต)
+
+- [[R1-Gate-pointer-nRF52840]] — ของกับดักที่ต้องปิดก่อนวัด + สถานะคอมไพล์
