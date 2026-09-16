@@ -1,20 +1,38 @@
-# nRF52840 LoRa P2P Node
+# nRF52840 LoRa Mesh Node
 
-LoRa P2P sensor node on **Pro Micro nRF52840 (NiceNano)** compatible with STM32 LoRa P2P network.
+LoRa mesh sensor node on **Pro Micro nRF52840 (NiceNano)**, interoperable with the STM32 LoRa P2P network.
+
+> **Protocol contract**: [MESH_PROTOCOL.md](MESH_PROTOCOL.md) is the single source of truth shared by
+> this repo and `2025-12-30_STM32_LoRaMesh`. Change one side and you must change the doc and the other side.
 
 ## Features
 
-- **Dual radio support**: SX1262 and RFM95/SX1276 — switch via `#define` at compile time
-- RadioHead-compatible packet format (interoperable with STM32 nodes using RH_RF95)
-- **Multi-hop relay** with duplicate detection, echo prevention, and message queue
-- **BLE GPS**: receive GPS coordinates from phone app, include in LoRa payload
-- **Node tracking**: OLED shows distance/direction to other nodes with compass arrow
-- XOR encryption + CRC16 (matches STM32 network protocol)
-- BME280 temperature/humidity sensor (auto-detect, simulated fallback)
-- SSD1306 OLED display (128x64, I2C) with status, GPS info, and debug log
-- Software bit-bang SPI for LoRa module (bypasses n-able core PINS_COUNT=34 bug)
-- Battery voltage monitoring
+- **Dual radio**: SX1262 (RA-01SH / HT-RA62) and RFM95/SX1276 — selected in `platformio.ini`, one line
+- RadioHead-compatible 4-byte header (interoperable with STM32 nodes using `RHDatagram`)
+- **Multi-hop relay** (MAX_HOPS=3) with duplicate cache, echo prevention, cancel-on-heard, RSSI-ranked delay
+- **VIA trace**: every relay appends `|V:<node>,<rssi>` so the gateway reconstructs the full path with per-hop RSSI
+- **ML relay decision**: 4→8→4→1 neural net (`include/rssi_classifier.h`), trained from `rssi_log.csv`
+- **Adaptive TX power (7–17 dBm) and SF (7–12)** based on last heard RSSI
+- **BLE GPS**: receive coordinates from a phone app, include in the LoRa payload
+- **Node tracking**: OLED shows distance/direction to other nodes with a compass arrow
+- XOR encryption + CRC16 (Modbus) — matches the STM32 network
+- BME280 temperature/humidity (auto-detect, simulated fallback), battery voltage monitoring
+- SSD1306 OLED (128x64, I2C) with status, GPS info, and debug log
+- Software bit-bang SPI for the LoRa module (bypasses the n-able core `PINS_COUNT=34` bug)
+- **Low-power idle** (`custom_low_power=1`): System-ON idle while LoRa RX and OLED stay on
+- **Measurement build** (`include/meas.h`): CSV propagation logging with frozen TX power — see below
 - Broadcast TX every 30 seconds, continuous RX
+
+## Configuration — all in `platformio.ini`
+
+```ini
+custom_node_id  = 115           ; 1–254, compiled into NODE_ID
+custom_radio    = USE_SX1262    ; or USE_RFM95
+custom_low_power = 1            ; 0 = CPU runs free, 1 = System-ON idle
+```
+
+Nothing has to be edited inside `src/main.cpp` to change node ID, radio, or power mode.
+nRF nodes in this network use IDs **115–119**; STM32 nodes use 102–105.
 
 ## Hardware
 
@@ -71,73 +89,133 @@ Pro Micro nRF52840          SSD1306 OLED
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency | 923 MHz |
-| Spreading Factor | 7 |
+| Frequency | 923.000 MHz |
+| Spreading Factor | 7 (adaptive 7–12 when enabled) |
 | Bandwidth | 125 kHz |
 | Coding Rate | 4/5 |
-| Sync Word | 0x12 |
-| TX Power | 12 dBm (PA_BOOST) |
+| Sync Word | RFM95/SX1276 `0x12` · SX1262 `0x1424` (equivalent public sync) |
+| TX Power | adaptive 7–17 dBm (STM32 side is fixed 10 dBm) |
 | Preamble | 8 symbols |
-| Node ID | 116 (configurable) |
+| Hardware CRC | enabled |
+| Node ID | `custom_node_id` in `platformio.ini` |
 
-## Protocol
+### Adaptive TX power / SF
 
-### Packet Structure (over-the-air)
+| Last heard RSSI | TX power | SF |
+|---|---|---|
+| ≥ −75 dBm | 7 dBm | 7 |
+| −75 to −90 | 10 dBm | 8 |
+| −90 to −105 | 14 dBm | 10 |
+| < −105 | 17 dBm | 12 |
+
+After 5 minutes of silence (`SILENCE_TIMEOUT_MS`) the node falls back to maximum power.
+Adaptation stays within the interop envelope — it does not change frequency, BW, CR, or sync word.
+
+## Protocol (summary — full contract in [MESH_PROTOCOL.md](MESH_PROTOCOL.md))
+
+### Packet Structure
 
 ```
-[Preamble][SyncWord][Length][ RadioHead Header (4 bytes) ][ Encrypted Payload ][ CRC16 ][ HW CRC ]
-                            [ TO ][ FROM ][ ID ][ FLAGS    ]
-                            [0xFF][ 116  ][ seq][ hop_count]
+| TO (0xFF) | FROM | ID | FLAGS | XOR(payload) | CRC16 |
+     1B       1B    1B    1B        n B           2B
 ```
 
-- **TO**: 0xFF (broadcast) or destination node ID
-- **FROM**: sender node ID (116) — relay changes this to relay node ID
-- **ID**: sequence number (auto-increment)
-- **FLAGS**: lower 4 bits = hop count (0 = origin, incremented per relay)
+- **TO**: always `0xFF` (broadcast)
+- **FROM**: the node transmitting *this hop* — not the original source
+- **ID**: 8-bit counter of the transmitting node, incremented on every packet including relays
+- **FLAGS**: bits 0–3 hop count · bit 4 `FLAG_IS_ACK` · bit 5 `FLAG_ACK_REQ` · bits 6–7 reserved by RadioHead
+
+> STM32 must **not** use `RHReliableDatagram` — `sendtoWait()` overwrites `FLAGS` and destroys the hop count.
 
 ### Payload Format
 
-Plaintext before encryption:
 ```
-N:116|S:0|T:28|H:65|B:3300|LA:13.736717|LO:100.523186
+N:115|S:0|T:28|H:65|B:3300|LA:13.736717|LO:100.523186|V:116,-103|V:104,-98
 ```
 
 | Field | Description |
 |-------|-------------|
 | N | Original source node ID (preserved through relay) |
-| S | Sequence number |
-| T | Temperature (°C, from BME280 or simulated) |
-| H | Humidity (%, from BME280 or simulated) |
-| B | Battery voltage (mV) |
-| LA | Latitude (from BLE GPS, optional) |
-| LO | Longitude (from BLE GPS, optional) |
+| S | Sequence number of the source (0–255 wrap) |
+| SIM:1 | STM32 only — BME280 did not answer, values are simulated |
+| T / H / B | Temperature °C / humidity % / battery mV (integers) |
+| LA / LO | Latitude / longitude from BLE GPS (6 decimals, optional) |
+| V | VIA trace: relay node ID + RSSI it heard the previous hop at |
 
-### Relay / Multi-Hop
+VIA grows ~11 bytes per hop; payload is capped at 200 bytes (`MAX_PAYLOAD_LEN`).
+Appending VIA changes the payload, so each relay **re-encrypts and recomputes CRC16**.
 
-- Relay triggers when RSSI <= -100 dBm and hop count < 3
-- Duplicate detection: source node + sequence number cache (TTL 5 min)
-- Echo prevention: skip packets where payload `N:` or header `FROM` matches own ID
-- Queued forwarding with random delay (1-3s) to reduce collisions
-- OLED shows: `FWD N:42 T:30 H:60%` + hop/RSSI details
+### Relay Rules
+
+1. `FROM == self` or `N: == self` → `DROP-ECHO`
+2. ACK addressed to us → `ACK-RCVD`, not forwarded
+3. Source unparseable → `DROP-PARSE`
+4. `(src, seq)` seen within 5 min → `DUP-SKIP`, **and cancel our own queued relay** (cancel-on-heard)
+5. `hop >= 3` → `DROP-HOP`
+6. Decision: **ML mode** runs `mlPredictRelay()` (relay when p ≥ 0.5) · **rule mode** skips when `hop == 0 && rssi >= rssiSourceClose`
+7. Otherwise queue with an RSSI-ranked delay: 200 / 700 / 1500 / 3000 ms (strongest signal transmits first)
+
+Duplicate cache: 10 slots, TTL 5 min, key `(src, seq)`.
+Adaptive threshold: `rssiSourceClose` starts at −100 dBm, EMA α=0.3 over CRC-valid packets, clamped −80…−120 dBm.
+OLED shows e.g. `FWD N:42 T:30 H:60%` plus hop/RSSI detail.
 
 ### Encryption
 
-- XOR with key `"1234567890000000"` (16 bytes, repeating)
-- CRC16 (polynomial 0xA001, init 0xFFFF) on encrypted data
-- CRC appended as 2 bytes (MSB first)
+- XOR with key `"1234567890000000"` (16 bytes, repeating) — obfuscation, not real security
+- CRC16 Modbus (poly `0xA001`, init `0xFFFF`) over the **ciphertext**, appended big-endian
 
 ## Build & Upload
 
 ```bash
-# Build
-pio run
-
-# Upload
+pio run                                     # normal build
 pio run --target upload
-
-# Serial monitor
 pio device monitor --baud 115200
 ```
+
+> **Apple Silicon**: the n-able platform pins an x86_64 `arm-none-eabi` toolchain (GCC 9.3.1), which fails with
+> "Bad CPU type" without Rosetta. `platformio.ini` overrides it with the arm64-native
+> `toolchain-gccarmnoneeabi@1.120301.0` (GCC 12) — no system changes needed.
+
+## ML Relay Decision
+
+The relay decision can be made by a small neural net instead of the RSSI rule:
+
+```
+Dense(4→8, ReLU) → Dense(8→4, ReLU) → Dense(4→1, sigmoid)
+input raw[4] = [rssi, src, from, node]   output p ≥ 0.5 → relay
+```
+
+Retraining workflow:
+
+```bash
+python3 tools/rssi_logger.py            # capture serial → rssi_log.csv
+python3 tools/train_model.py rssi_log.csv   # writes include/rssi_classifier.h
+pio run --target upload
+```
+
+`train_model.py` trains with numpy only (no TensorFlow/sklearn) and writes **the header the firmware
+actually compiles**, `include/rssi_classifier.h`, with the 4-input ABI in the firmware's order.
+Features that were constant during logging get `std = 0` so the firmware zeroes them instead of
+amplifying a one-off node ID to ±1e6 and saturating every ReLU.
+
+## Measurement Build (propagation campaign)
+
+`env:pro_micro_nrf52840_meas` adds `-DFW_MEAS_MODE` and changes three things — the normal build is untouched:
+
+1. reads **SNR and SignalRSSI** from `GetPacketStatus` (previously read and discarded)
+2. logs **every TX and every RX** as CSV to serial, including lost frames and CRC failures
+3. **freezes TX power**, since adaptive power makes RSSI-vs-distance a feedback loop instead of path loss
+
+```bash
+pio run -e pro_micro_nrf52840_meas --target upload
+pio device monitor --baud 115200
+```
+
+Serial commands: `RUN <id>` · `POS <id>` · `SF <5-12>` · `PWR <-9..22>` · `PL <19-250>` ·
+`SFLIST 7,9,12` · `SEND <n> [gap_ms]` · `CYCLE <dwell_ms> <frames>` · `SYNC` · `NOISE [n]` ·
+`QUIET <0|1>` · `MEAS?` · `HELP`.
+The log schema matches the FireWild_DePIN `_meas` build, so the same analysis scripts work on both.
+`SEND` and `PL` print a 1% duty-cycle warning when the requested gap is too short.
 
 ## Known Issues (n-able Arduino Core)
 
@@ -158,40 +236,41 @@ nrf_gpio_pin_read(pin);     // instead of digitalRead(pin)
 - Do NOT call `i2cDevicePresent()` before `display.begin()` -- corrupts I2C bus
 - Must have `delay(2000)` after `Serial.begin()` for power stabilization
 
-## Radio Module Selection
-
-Both **SX1262** and **RFM95 (SX1276)** are supported in a single firmware. Switch by editing the `#define` at the top of `src/main.cpp`:
-
-```cpp
-// เลือก module โดย uncomment อันที่ใช้ (เลือกได้อันเดียว)
-//#define USE_SX1262          // SX1262 module (command-based SPI, DIO1+BUSY)
-#define USE_RFM95         // RFM95/SX1276 module (register-based SPI, DIO0)
-```
+## Radio Module Comparison
 
 | | RFM95 (SX1276) | SX1262 |
 |---|---|---|
 | SPI protocol | Register-based | Command-based |
 | Interrupt pin | DIO0 | DIO1 |
 | BUSY pin | Not needed | Required (P0.03) |
+| Sync word | `0x12` | `0x1424` |
 | Max TX power | +20 dBm | +22 dBm |
 
 ## Project Structure
 
 ```
-├── src/
-│   └── main.cpp              # Main firmware (SX1262/RFM95 + BLE GPS + relay)
-├── platformio.ini             # PlatformIO build config
+├── src/main.cpp                # Firmware: radio, relay, VIA trace, BLE GPS, OLED
+├── include/
+│   ├── lora_config.h           # PHY parameters
+│   ├── rssi_classifier.h       # Generated NN weights (do not edit by hand)
+│   └── meas.h                  # Measurement mode (only under -DFW_MEAS_MODE)
+├── tools/
+│   ├── rssi_logger.py          # Serial → rssi_log.csv
+│   └── train_model.py          # CSV → include/rssi_classifier.h
+├── nRF52840_vault/             # Obsidian vault (PARA): notes, datasets, build logs
+├── MESH_PROTOCOL.md            # Shared protocol contract with the STM32 repo
+├── ble_gps_sender.html         # Phone-side BLE GPS sender
+├── platformio.ini              # Node ID / radio / power mode / build envs
 └── README.md
 ```
 
 ## STM32 Compatibility
 
-This node is fully compatible with the STM32 LoRa P2P network:
-- Same LoRa parameters (923MHz, SF7, BW125kHz, CR4/5, Sync 0x12)
-- Same RadioHead header format (4-byte header)
-- Same XOR encryption with shared key
-- Same CRC16 algorithm and byte order
-- Relay preserves original payload — STM32 gateway sees original `N:` source
+Fully compatible with the STM32 LoRa mesh:
+- Same PHY (923 MHz, SF7, BW125 kHz, CR4/5, equivalent sync word, HW CRC on)
+- Same 4-byte RadioHead header and FLAGS layout
+- Same XOR key, same CRC16 algorithm and byte order
+- Relay preserves the original `N:` source and appends VIA, so the gateway sees both origin and path
 
 ## License
 
